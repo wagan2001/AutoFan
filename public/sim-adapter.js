@@ -7,10 +7,10 @@ export class BrowserSimAdapter {
     this.name = "Browser simulation adapter";
     this.lastUpdate = performance.now();
     this.fans = [
-      { id: "cpu_cooler", label: "CPU cooler", role: "cpu", source: "motherboard", pwm: 35, rpm: 850, minPwm: 20, maxPwm: 100 },
-      { id: "case_intake", label: "Case intake", role: "case", source: "motherboard", pwm: 30, rpm: 620, minPwm: 18, maxPwm: 100 },
-      { id: "case_exhaust", label: "Case exhaust", role: "case", source: "motherboard", pwm: 30, rpm: 650, minPwm: 18, maxPwm: 100 },
-      { id: "gpu_fan", label: "GPU fan", role: "ignore", source: "gpu", pwm: 40, rpm: 1100, minPwm: 0, maxPwm: 100 }
+      { id: "cpu_cooler", label: "CPU cooler", role: "cpu", fanType: "air", source: "motherboard", identifier: "/lpc/sim/0/control/0", rpmIdentifier: "/lpc/sim/0/fan/0", pwm: 35, rpm: 850, minPwm: 20, maxPwm: 100 },
+      { id: "case_intake", label: "Case intake", role: "case", fanType: "cpu_intake", source: "motherboard", identifier: "/lpc/sim/0/control/1", rpmIdentifier: "/lpc/sim/0/fan/1", pwm: 30, rpm: 620, minPwm: 18, maxPwm: 100 },
+      { id: "case_exhaust", label: "Case exhaust", role: "case", fanType: "exhaust", source: "motherboard", identifier: "/lpc/sim/0/control/2", rpmIdentifier: "/lpc/sim/0/fan/2", pwm: 30, rpm: 650, minPwm: 18, maxPwm: 100 },
+      { id: "gpu_fan", label: "GPU fan", role: "ignore", fanType: "", source: "gpu", identifier: "/gpu-nvidia/0/control/1", rpmIdentifier: "/gpu-nvidia/0/fan/1", pwm: 40, rpm: 1100, minPwm: 0, maxPwm: 100 }
     ];
     this.temps = { cpu: 36, gpu: 34, case: 31, ambient: 23 };
   }
@@ -19,7 +19,12 @@ export class BrowserSimAdapter {
     return {
       adapter: this.name,
       fans: this.fans.map((fan) => ({ ...fan })),
-      capabilities: ["readSensors", "setFanPwm", "syntheticTelemetry"]
+      capabilities: ["readSensors", "setFanPwm", "syntheticTelemetry"],
+      sensorIdentifiers: {
+        cpu: "/amdcpu/0/temperature/2",
+        gpu: "/gpu-nvidia/0/temperature/0",
+        case: "/lpc/sim/0/temperature/1"
+      }
     };
   }
 

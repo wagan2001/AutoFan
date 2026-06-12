@@ -7,14 +7,16 @@
 // the learned data, and (d) survives a serialize/hydrate round trip (page reload).
 
 import assert from "node:assert/strict";
-import { FanOptimizer, isOptimized } from "../public/optimizer.js";
+import { FanOptimizer, isOptimized, combineScenarioCurves, CPU_TARGET_PRESETS } from "../public/optimizer.js";
 import { BrowserSimAdapter } from "../public/sim-adapter.js";
+import { buildFanControlConfig, toFanControlIdentifier } from "../public/fancontrol-export.js";
 
 const ITERATIONS = 600; // ≈ 60 simulated seconds (sim clamps dt to >= 0.1 s)
 const loadState = { mode: "cpu", cpu: true, gpu: false };
 
 const adapter = new BrowserSimAdapter();
 const optimizer = new FanOptimizer();
+optimizer.setCpuTarget(78); // pin the target so assertions are independent of the default
 optimizer.start();
 
 let telemetry = await adapter.readTelemetry(loadState);
@@ -82,6 +84,88 @@ assert.deepEqual(
   profile.rawScenarioPoints,
   "serialize -> hydrate -> serialize must round-trip"
 );
+
+// 6. Capture gate: with captureEnabled=false (heat-soak phase) the optimizer still
+// drives fans but records nothing.
+{
+  const gated = new FanOptimizer();
+  gated.captureEnabled = false;
+  const recs = gated.recommend(telemetry, loadState);
+  assert.ok(recs.length > 0, "gated optimizer still recommends PWM");
+  const gatedCounts = gated.scenarioCounts();
+  assert.equal(gatedCounts.cpu + gatedCounts.gpu + gatedCounts.system, 0,
+    "no scenario points may be captured while capture is disabled");
+}
+
+// 7. CPU target presets and clamping.
+{
+  const t = new FanOptimizer();
+  assert.equal(t.setCpuTarget(CPU_TARGET_PRESETS.ryzen), 85);
+  assert.equal(t.setCpuTarget(CPU_TARGET_PRESETS.intel), 90);
+  assert.equal(t.setCpuTarget(200), 95, "target must clamp to a safe ceiling");
+  assert.equal(t.setCpuTarget(10), 60, "target must clamp to a sensible floor");
+}
+
+// 8. AIO damping: an AIO CPU fan must step more gently than an air cooler under the
+// same hot, fast-rising conditions.
+{
+  const makeTelemetry = (fanType, timestamp, cpuTempC) => ({
+    timestamp,
+    sensors: { cpuTempC, gpuTempC: 50, caseTempC: 35, ambientTempC: 23 },
+    fans: [{ id: "f", label: "f", role: "cpu", fanType, pwm: 30, minPwm: 0, maxPwm: 100 }]
+  });
+  const step = (fanType) => {
+    const opt = new FanOptimizer();
+    opt.recommend(makeTelemetry(fanType, "2026-01-01T00:00:00Z", 70), { mode: "cpu" });
+    const [rec] = opt.recommend(makeTelemetry(fanType, "2026-01-01T00:00:01Z", 74), { mode: "cpu" });
+    return rec.pwm - 30;
+  };
+  assert.ok(step("aio") < step("air"), `AIO step (${step("aio")}) must be smaller than air step (${step("air")})`);
+}
+
+// 9. Algorithmic combination: scenario weights must matter. The same learned GPU
+// scenario point lifts a gpu_intake fan's curve more than a cpu cooler's curve.
+{
+  const scenarios = { cpu: new Map(), gpu: new Map(), system: new Map() };
+  scenarios.gpu.set("f:60", 95); // gpu scenario demanded 95% at 60°C
+  const fanOf = (role, fanType) => ({ id: "f", label: "f", role, fanType, minPwm: 0, maxPwm: 100 });
+
+  const at60 = (curve) => curve.find((point) => point.tempC === 60).pwm;
+  const gpuIntake = at60(combineScenarioCurves(fanOf("case", "gpu_intake"), scenarios));
+  const cpuCooler = at60(combineScenarioCurves(fanOf("cpu", "air"), scenarios));
+  assert.ok(gpuIntake > cpuCooler,
+    `gpu scenario must lift gpu_intake (${gpuIntake}) more than a cpu cooler (${cpuCooler})`);
+
+  // And the soft combination must sit between the base curve and the raw demand —
+  // not naively snap to the max.
+  assert.ok(gpuIntake < 95, `combined value (${gpuIntake}) must stay below the naive max (95)`);
+  assert.ok(gpuIntake > 70, `combined value (${gpuIntake}) must move well above the base curve`);
+}
+
+// 10. FanControl export: identifier mapping, curve points format, enabled flags.
+{
+  const fcProfile = optimizer.buildProfile(telemetry.fans);
+  const config = buildFanControlConfig(fcProfile, telemetry.fans, {
+    cpu: "/amdcpu/0/temperature/2",
+    gpu: "/gpu-nvidia/0/temperature/0"
+  });
+
+  assert.equal(config.__VERSION__, "269");
+  assert.equal(toFanControlIdentifier("/lpc/nct6799d/0/control/1"), "/lpc/nct6799d/control/1");
+  assert.equal(toFanControlIdentifier("/amdcpu/0/temperature/2"), "/amdcpu/0/temperature/2");
+
+  const enabled = config.FanControl.Controls.filter((control) => control.Enable);
+  assert.equal(enabled.length, fcProfile.fans.length, "every optimized fan gets an enabled control");
+  const gpuControl = config.FanControl.Controls.find((control) => control.NickName === "GPU fan");
+  assert.ok(gpuControl && !gpuControl.Enable && gpuControl.IsHidden, "GPU fan must be exported disabled+hidden");
+
+  assert.equal(config.FanControl.FanCurves.length, fcProfile.fans.length);
+  for (const curve of config.FanControl.FanCurves) {
+    assert.ok(curve.Points.every((point) => /^\d+,\d+$/.test(point)), "points must be 'temp,pwm' strings");
+    assert.ok(curve.SelectedTempSource.Identifier.startsWith("Time/AFT"), "curves must follow the averaged custom sensors");
+  }
+  assert.equal(config.FanControl.CustomSensors.length, 2, "cpu + gpu averaged sensors expected");
+}
 
 console.log("optimizer test passed");
 console.log(`  peak CPU temp: ${peakCpu.toFixed(1)}°C (target ${optimizer.targets.cpuTempC}°C)`);

@@ -28,6 +28,20 @@ npm test   # simulated end-to-end optimizer verification (no hardware needed)
 - Live optimizer activity log and learned-point counters, so you can watch every PWM
   decision and confirm scenario data is being captured.
 - Auto-detect sweep that finds which fan headers actually have fans connected.
+- One-click **Auto-Optimize**: runs CPU → GPU → full-system scenarios automatically,
+  each with a heat-soak phase (load on, nothing recorded until temperatures flatten),
+  a measurement phase, and a cooldown — with a progress bar, time-remaining estimate,
+  and a safety cutoff that ramps fans to 100% if the CPU approaches its limit.
+- Detailed fan types that shape the optimization: CPU coolers are Air or AIO (AIO
+  control is damped to account for coolant thermal lag); case fans are CPU intake,
+  GPU intake, or Exhaust (each follows the temperature source it actually serves).
+- Algorithmic universal-curve combination: per-scenario curves merge through a
+  weighted power mean (per-fan-type scenario relevance weights, smoothing, monotonic
+  enforcement) instead of a naive max.
+- Custom CPU temperature target with Ryzen (85°C) and Intel (90°C) presets.
+- **Export FanControl**: generates a config compatible with Rem0o's FanControl
+  (controls, per-fan curves bound to time-averaged temp sensors, paired RPM sensors),
+  so optimized curves can run under FanControl directly.
 
 ## Hardware Boundary
 

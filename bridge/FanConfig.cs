@@ -9,7 +9,10 @@ namespace FanBridge;
 internal sealed class FanConfigEntry
 {
     public string Label { get; set; } = "";
-    public string Role { get; set; } = "case"; // "cpu" | "case"
+    public string Role { get; set; } = "case"; // "cpu" | "case" | "ignore"
+    // Detail used by the optimizer: cpu fans are "air" | "aio";
+    // case fans are "cpu_intake" | "gpu_intake" | "exhaust".
+    public string FanType { get; set; } = "";
     public int MinPwm { get; set; }
     public int MaxPwm { get; set; } = 100;
 }
@@ -19,6 +22,7 @@ internal sealed class FanConfigPatch
 {
     public string? Label { get; set; }
     public string? Role { get; set; }
+    public string? FanType { get; set; }
     public int? MinPwm { get; set; }
     public int? MaxPwm { get; set; }
 }

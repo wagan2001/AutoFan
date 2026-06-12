@@ -1,5 +1,6 @@
-import { FanOptimizer, SAMPLE_INTERVAL_MS, clamp, isOptimized } from "./optimizer.js";
+import { FanOptimizer, SAMPLE_INTERVAL_MS, clamp, isOptimized, FAN_TYPES, defaultFanType, CPU_TARGET_PRESETS } from "./optimizer.js";
 import { BrowserSimAdapter } from "./sim-adapter.js";
+import { buildFanControlConfig } from "./fancontrol-export.js";
 
 const FAN_PROFILE_KEY = "automatic-fan-tuner-profile-v1";
 
@@ -177,13 +178,25 @@ const elements = {
   startOptimizer: document.querySelector("#start-optimizer"),
   stopAll: document.querySelector("#stop-all"),
   exportProfile: document.querySelector("#export-profile"),
+  exportFanControl: document.querySelector("#export-fancontrol"),
   autoDetect: document.querySelector("#auto-detect"),
+  autoOptimize: document.querySelector("#auto-optimize"),
+  autoStatus: document.querySelector("#auto-status"),
+  autoProgress: document.querySelector("#auto-progress"),
+  cpuTarget: document.querySelector("#cpu-target"),
   gpuCanvas: document.querySelector("#gpu-canvas")
 };
 
 // While the auto-detect sweep runs, the periodic loop should not fight it for the
 // calibration status line or write PWM.
 let detecting = false;
+
+// One-click optimization routine state.
+let autoRun = { active: false, abort: false, doneMs: 0 };
+
+// Raw temperature sensor identifiers reported by the adapter, used for FanControl
+// config export.
+let sensorIdentifiers = null;
 
 const activityLog = [];
 
@@ -208,6 +221,10 @@ if (savedProfile?.rawScenarioPoints) {
   const restored = counts.cpu + counts.gpu + counts.system;
   if (restored > 0) logActivity(`Restored ${restored} learned scenario points from the previous session`);
 }
+if (savedProfile?.optimizer?.targets?.cpuTempC) {
+  optimizer.setCpuTarget(savedProfile.optimizer.targets.cpuTempC);
+}
+elements.cpuTarget.value = optimizer.targets.cpuTempC;
 let profile = optimizer.buildProfile(telemetry.fans);
 
 renderAll();
@@ -250,6 +267,10 @@ elements.startOptimizer.addEventListener("click", () => {
 });
 
 elements.stopAll.addEventListener("click", async () => {
+  if (autoRun.active) {
+    autoRun.abort = true; // the routine handles its own teardown
+    return;
+  }
   optimizer.stop();
   loadController.stop();
   // Only park fans we manage; GPU/ignored fans stay on BIOS control.
@@ -269,6 +290,34 @@ elements.exportProfile.addEventListener("click", () => {
   URL.revokeObjectURL(link.href);
   const counts = optimizer.scenarioCounts();
   logActivity(`Exported profile (${counts.cpu} cpu / ${counts.gpu} gpu / ${counts.system} system learned points)`);
+});
+
+elements.exportFanControl.addEventListener("click", () => {
+  const config = buildFanControlConfig(profile, telemetry.fans, sensorIdentifiers);
+  const blob = new Blob([JSON.stringify(config, null, 2)], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `fancontrol-aft-${new Date().toISOString().replaceAll(":", "-")}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+  logActivity(`Exported FanControl config (${profile.fans.length} curves, ${telemetry.fans.length} controls)`);
+});
+
+elements.cpuTarget.addEventListener("change", () => {
+  const applied = optimizer.setCpuTarget(Number(elements.cpuTarget.value) || optimizer.targets.cpuTempC);
+  elements.cpuTarget.value = applied;
+  logActivity(`CPU temperature target set to ${applied}°C`);
+  renderAll();
+});
+
+document.querySelectorAll("[data-target-preset]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const preset = button.dataset.targetPreset;
+    const applied = optimizer.setCpuTarget(CPU_TARGET_PRESETS[preset]);
+    elements.cpuTarget.value = applied;
+    logActivity(`CPU temperature target set to ${applied}°C (${preset} preset)`);
+    renderAll();
+  });
 });
 
 elements.autoDetect.addEventListener("click", () => autoDetectFans());
@@ -326,6 +375,130 @@ async function autoDetectFans() {
   }
 }
 
+// ----- One-click optimization -----------------------------------------------------
+//
+// Runs every load scenario in sequence. Each scenario gets a heat-soak phase (load on,
+// fans managed, but nothing recorded — components approach steady state within safe
+// limits) followed by a measurement phase (scenario points recorded), then a cooldown
+// before the next scenario so each one starts from a comparable baseline.
+const AUTO_PLAN = [
+  { scenario: "cpu", soakMs: 90_000, measureMs: 120_000, cooldownMs: 60_000 },
+  { scenario: "gpu", soakMs: 90_000, measureMs: 120_000, cooldownMs: 60_000 },
+  { scenario: "system", soakMs: 120_000, measureMs: 150_000, cooldownMs: 0 }
+];
+
+const autoTotalMs = () => AUTO_PLAN.reduce((sum, step) => sum + step.soakMs + step.measureMs + step.cooldownMs, 0);
+
+const formatDuration = (ms) => {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+};
+
+elements.autoOptimize.addEventListener("click", () => runAutoOptimization());
+
+async function runAutoOptimization() {
+  if (autoRun.active || detecting) return;
+  autoRun = { active: true, abort: false, doneMs: 0 };
+  elements.autoOptimize.disabled = true;
+  elements.autoDetect.disabled = true;
+  optimizer.start();
+  logActivity(`Auto-optimization started — ~${formatDuration(autoTotalMs())} estimated (soak → measure → cooldown per scenario)`);
+  const baselineCpu = telemetry.sensors.cpuTempC;
+
+  try {
+    for (const step of AUTO_PLAN) {
+      if (autoRun.abort) break;
+      await runPhase(`Heat soak — ${step.scenario.toUpperCase()}`, step.soakMs, {
+        load: step.scenario,
+        capture: false,
+        // A soak is done early once the CPU temperature has flattened out.
+        earlyExit: () => cpuTempFlat()
+      });
+      if (autoRun.abort) break;
+      await runPhase(`Measuring — ${step.scenario.toUpperCase()}`, step.measureMs, {
+        load: step.scenario,
+        capture: true
+      });
+      if (autoRun.abort || !step.cooldownMs) continue;
+      await runPhase("Cooldown", step.cooldownMs, {
+        load: "idle",
+        capture: false,
+        earlyExit: () => telemetry.sensors.cpuTempC <= baselineCpu + 6
+      });
+    }
+  } finally {
+    optimizer.captureEnabled = true;
+    loadController.stop();
+    optimizer.stop();
+    for (const fan of telemetry.fans.filter(isOptimized)) {
+      await adapter.setFanPwm(fan.id, Math.max(fan.minPwm, 30));
+    }
+    const counts = optimizer.scenarioCounts();
+    logActivity(autoRun.abort
+      ? "Auto-optimization aborted — partial scenario data kept"
+      : `Auto-optimization complete — learned points: cpu=${counts.cpu} gpu=${counts.gpu} system=${counts.system}. Universal profile rebuilt.`);
+    autoRun = { active: false, abort: false, doneMs: 0 };
+    elements.autoOptimize.disabled = false;
+    elements.autoDetect.disabled = false;
+    elements.autoStatus.textContent = "Idle";
+    elements.autoProgress.style.width = "0%";
+    renderAll();
+  }
+}
+
+async function runPhase(label, durationMs, { load, capture, earlyExit }) {
+  if (loadController.mode !== load) {
+    if (load === "idle") loadController.stop();
+    else loadController.start(load);
+  }
+  optimizer.captureEnabled = capture;
+  renderAll();
+
+  const start = performance.now();
+  const safeLimitC = Math.min(optimizer.targets.cpuTempC + 10, 95);
+
+  while (!autoRun.abort) {
+    const elapsed = performance.now() - start;
+    if (elapsed >= durationMs) break;
+    updateAutoProgress(label, elapsed, durationMs);
+
+    if (telemetry.sensors.cpuTempC >= safeLimitC) {
+      logActivity(`Safety: CPU ${telemetry.sensors.cpuTempC.toFixed(1)}°C ≥ ${safeLimitC}°C — managed fans to 100%, ending phase early`);
+      for (const fan of telemetry.fans.filter(isOptimized)) {
+        await adapter.setFanPwm(fan.id, 100);
+      }
+      break;
+    }
+    // Give every phase at least 20 s before allowing an early exit so transient
+    // flatness right after a load change can't cut a phase short.
+    if (earlyExit && elapsed > 20_000 && earlyExit()) {
+      logActivity(`${label}: finished early (condition reached at ${formatDuration(elapsed)})`);
+      break;
+    }
+    await delay(1000);
+  }
+
+  // Credit the full planned duration so progress/ETA always move forward.
+  autoRun.doneMs += durationMs;
+}
+
+function updateAutoProgress(label, phaseElapsed, phaseDuration) {
+  const total = autoTotalMs();
+  const consumed = Math.min(autoRun.doneMs + Math.min(phaseElapsed, phaseDuration), total);
+  elements.autoProgress.style.width = `${((consumed / total) * 100).toFixed(1)}%`;
+  elements.autoStatus.textContent = `${label} — ${formatDuration(total - consumed)} remaining`;
+}
+
+// True when the CPU temperature has stopped climbing (heat soak reached): less than
+// 1°C of movement across the last 12 optimizer samples (~12 s).
+function cpuTempFlat() {
+  const recent = optimizer.samples.slice(-12).map((sample) => sample.sensors.cpuTempC);
+  if (recent.length < 12) return false;
+  return Math.max(...recent) - Math.min(...recent) < 1.0;
+}
+
 document.querySelectorAll("[data-load]").forEach((button) => {
   button.addEventListener("click", () => {
     const mode = button.dataset.load;
@@ -354,6 +527,7 @@ async function initializeAdapter() {
   for (const candidate of candidates) {
     try {
       const capabilities = await candidate.connect();
+      sensorIdentifiers = capabilities.sensorIdentifiers ?? null;
       elements.adapterStatus.textContent = `${capabilities.adapter} connected with ${capabilities.fans.length} controllable fans`;
       return candidate;
     } catch (error) {
@@ -387,8 +561,9 @@ function renderAll() {
 
   document.querySelectorAll("[data-load]").forEach((button) => {
     button.classList.toggle("active", loadState.mode === button.dataset.load);
+    button.disabled = autoRun.active;
   });
-  elements.startOptimizer.disabled = optimizer.mode === "optimizing";
+  elements.startOptimizer.disabled = optimizer.mode === "optimizing" || autoRun.active;
   elements.startOptimizer.textContent = optimizer.mode === "optimizing" ? "Optimizing…" : "Start Optimizer";
 
   const detectedFans = telemetry?.fans ?? [];
@@ -436,11 +611,36 @@ function renderFans() {
       role.append(item);
     }
     role.addEventListener("change", async () => {
-      await adapter.updateFan(fan.id, { role: role.value });
+      // Changing role resets the detail type to that role's default.
+      await adapter.updateFan(fan.id, { role: role.value, fanType: defaultFanType(role.value) });
       telemetry = await adapter.readTelemetry(loadController.getState());
       renderAll();
     });
     roleLabel.append(role);
+
+    // Detail type select (Air/AIO for CPU; intake/exhaust placement for case fans).
+    const typeOptions = FAN_TYPES[fan.role];
+    let typeLabel = null;
+    if (typeOptions) {
+      typeLabel = document.createElement("label");
+      typeLabel.textContent = "Type";
+      const type = document.createElement("select");
+      const current = fan.fanType || defaultFanType(fan.role);
+      for (const option of typeOptions) {
+        const item = document.createElement("option");
+        item.value = option.value;
+        item.textContent = option.label;
+        item.selected = current === option.value;
+        type.append(item);
+      }
+      type.addEventListener("change", async () => {
+        await adapter.updateFan(fan.id, { fanType: type.value });
+        telemetry = await adapter.readTelemetry(loadController.getState());
+        logActivity(`${fan.label} type set to ${type.options[type.selectedIndex].text}`);
+        renderAll();
+      });
+      typeLabel.append(type);
+    }
 
     const meta = document.createElement("div");
     meta.className = "fan-meta";
@@ -460,7 +660,8 @@ function renderFans() {
       fanButton("100%", "warn", async () => setAndRefresh(fan.id, 100))
     );
 
-    row.append(label, roleLabel, meta, actions);
+    if (typeLabel) row.append(label, roleLabel, typeLabel, meta, actions);
+    else row.append(label, roleLabel, meta, actions);
     return row;
   }));
 }

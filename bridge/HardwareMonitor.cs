@@ -95,10 +95,12 @@ internal sealed class HardwareMonitor
         {
             // GPU fans are left to BIOS by design, so default them to "ignore" — only
             // motherboard/EC fans are optimization candidates out of the box.
+            var role = source == "gpu" ? "ignore" : "case";
             cfg = new FanConfigEntry
             {
                 Label = rawName,
-                Role = source == "gpu" ? "ignore" : "case",
+                Role = role,
+                FanType = DefaultFanType(role),
                 MinPwm = 0,
                 MaxPwm = 100
             };
@@ -106,6 +108,13 @@ internal sealed class HardwareMonitor
         }
         _channels[id] = new FanChannel(id, fan, control, cfg, source);
     }
+
+    internal static string DefaultFanType(string role) => role switch
+    {
+        "cpu" => "air",
+        "case" => "exhaust",
+        _ => ""
+    };
 
     // Classify where a fan channel lives so the UI/optimizer can treat GPU fans
     // (out of scope) differently from motherboard/EC fans.
@@ -146,6 +155,12 @@ internal sealed class HardwareMonitor
             {
                 adapter = "PawnIO bridge (LibreHardwareMonitor)",
                 capabilities = new[] { "readSensors", "setFanPwm", "labelFans" },
+                sensorIdentifiers = new
+                {
+                    cpu = _cpuTemp?.Identifier.ToString(),
+                    gpu = _gpuTemp?.Identifier.ToString(),
+                    @case = _caseTemp?.Identifier.ToString()
+                },
                 fans = _channels.Values.Select(c => c.ToView()).ToArray()
             };
         }
@@ -194,7 +209,14 @@ internal sealed class HardwareMonitor
         {
             if (!_config.TryGetValue(id, out var cfg)) return false;
             if (!string.IsNullOrWhiteSpace(patch.Label)) cfg.Label = patch.Label.Trim();
-            if (!string.IsNullOrWhiteSpace(patch.Role)) cfg.Role = patch.Role.Trim();
+            if (!string.IsNullOrWhiteSpace(patch.Role))
+            {
+                cfg.Role = patch.Role.Trim();
+                // Keep the fan type coherent when the role changes and no explicit
+                // type was supplied alongside it.
+                if (string.IsNullOrWhiteSpace(patch.FanType)) cfg.FanType = DefaultFanType(cfg.Role);
+            }
+            if (patch.FanType != null) cfg.FanType = patch.FanType.Trim();
             if (patch.MinPwm is { } min) cfg.MinPwm = (int)Math.Clamp(min, 0, 100);
             if (patch.MaxPwm is { } max) cfg.MaxPwm = (int)Math.Clamp(max, 0, 100);
             FanConfigStore.Save(_config);
@@ -312,13 +334,17 @@ internal sealed class FanChannel
 
     public bool Controllable => Control?.Control != null;
 
-    // Shape matches the browser BrowserSimAdapter fan object.
+    // Shape matches the browser BrowserSimAdapter fan object. Raw LHM identifiers are
+    // included so exports (e.g. FanControl configs) can reference the real hardware.
     public object ToView() => new
     {
         id = Id,
         label = Config.Label,
         role = Config.Role,
+        fanType = Config.FanType,
         source = Source,
+        identifier = (Control ?? Fan)?.Identifier.ToString(),
+        rpmIdentifier = Fan?.Identifier.ToString(),
         pwm = Control?.Value is { } p ? (int)Math.Round(p) : 0,
         rpm = Fan?.Value is { } r ? (int)Math.Round(r) : 0,
         minPwm = Config.MinPwm,

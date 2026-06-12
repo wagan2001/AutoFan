@@ -125,6 +125,50 @@ label {
   margin-bottom: 12px;
 }
 
+.opt-controls {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: end;
+  margin-bottom: 14px;
+}
+
+.target-field {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.target-field input {
+  width: 90px;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #13171d;
+  color: var(--text);
+  padding: 0 10px;
+}
+
+.progress {
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #0d1117;
+  overflow: hidden;
+}
+
+.progress > div {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 600ms linear;
+}
+
+.hint {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
