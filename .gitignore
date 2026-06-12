@@ -1,0 +1,15 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# .NET (FanBridge)
+bridge/bin/
+bridge/obj/
+
+# Bridge runtime state (generated per-machine)
+bridge/fan-config.json
+bridge/lhm-report.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db

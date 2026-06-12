@@ -4,14 +4,27 @@ const SAMPLE_INTERVAL_MS = 1000;
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const round = (value, places = 1) => Number(value.toFixed(places));
 
+// Only motherboard/EC fans are optimization targets. GPU fans (and anything the user
+// marks "ignore") are left to BIOS control, matching the project's scope.
+const OPTIMIZED_ROLES = new Set(["cpu", "case"]);
+const isOptimized = (fan) => OPTIMIZED_ROLES.has(fan.role);
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Auto-detect tuning: at 100% PWM any connected fan spins well above this; an empty
+// header (or a dead one) stays at ~0 RPM, so this threshold separates the two.
+const PRESENCE_RPM = 200;
+const SPINUP_SETTLE_MS = 2500;
+
 class BrowserSimAdapter {
   constructor() {
     this.name = "Browser simulation adapter";
     this.lastUpdate = performance.now();
     this.fans = [
-      { id: "cpu_cooler", label: "CPU cooler", role: "cpu", pwm: 35, rpm: 850, minPwm: 20, maxPwm: 100 },
-      { id: "case_intake", label: "Case intake", role: "case", pwm: 30, rpm: 620, minPwm: 18, maxPwm: 100 },
-      { id: "case_exhaust", label: "Case exhaust", role: "case", pwm: 30, rpm: 650, minPwm: 18, maxPwm: 100 }
+      { id: "cpu_cooler", label: "CPU cooler", role: "cpu", source: "motherboard", pwm: 35, rpm: 850, minPwm: 20, maxPwm: 100 },
+      { id: "case_intake", label: "Case intake", role: "case", source: "motherboard", pwm: 30, rpm: 620, minPwm: 18, maxPwm: 100 },
+      { id: "case_exhaust", label: "Case exhaust", role: "case", source: "motherboard", pwm: 30, rpm: 650, minPwm: 18, maxPwm: 100 },
+      { id: "gpu_fan", label: "GPU fan", role: "ignore", source: "gpu", pwm: 40, rpm: 1100, minPwm: 0, maxPwm: 100 }
     ];
     this.temps = { cpu: 36, gpu: 34, case: 31, ambient: 23 };
   }
@@ -97,8 +110,12 @@ class PawnIoAdapter {
     });
   }
 
-  async updateFan() {
-    return undefined;
+  async updateFan(fanId, patch) {
+    await fetch(`${this.endpoint}/fans/${encodeURIComponent(fanId)}/config`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(patch)
+    });
   }
 
   async readTelemetry() {
@@ -236,7 +253,7 @@ class FanOptimizer {
     this.samples.push(sample);
     if (this.samples.length > 900) this.samples.shift();
 
-    const recommendations = telemetry.fans.map((fan) => {
+    const recommendations = telemetry.fans.filter(isOptimized).map((fan) => {
       const sourceTemp = fan.role === "cpu"
         ? telemetry.sensors.cpuTempC
         : Math.max(telemetry.sensors.caseTempC + 12, telemetry.sensors.cpuTempC - 10, telemetry.sensors.gpuTempC - 8);
@@ -271,7 +288,7 @@ class FanOptimizer {
 
   buildProfile(fans) {
     const generatedAt = new Date().toISOString();
-    const fanProfiles = fans.map((fan) => ({
+    const fanProfiles = fans.filter(isOptimized).map((fan) => ({
       id: fan.id,
       label: fan.label,
       role: fan.role,
@@ -414,8 +431,13 @@ const elements = {
   startOptimizer: document.querySelector("#start-optimizer"),
   stopAll: document.querySelector("#stop-all"),
   exportProfile: document.querySelector("#export-profile"),
+  autoDetect: document.querySelector("#auto-detect"),
   gpuCanvas: document.querySelector("#gpu-canvas")
 };
+
+// While the auto-detect sweep runs, the periodic loop should not fight it for the
+// calibration status line or write PWM.
+let detecting = false;
 
 const loadController = new LoadController(elements.gpuCanvas);
 const optimizer = new FanOptimizer();
@@ -426,6 +448,7 @@ let profile = loadProfile() || optimizer.buildProfile(telemetry.fans);
 renderAll();
 
 setInterval(async () => {
+  if (detecting) return; // the sweep owns the fans while it runs
   telemetry = await adapter.readTelemetry(loadController.getState());
 
   if (optimizer.mode === "optimizing") {
@@ -462,6 +485,56 @@ elements.exportProfile.addEventListener("click", () => {
   URL.revokeObjectURL(link.href);
 });
 
+elements.autoDetect.addEventListener("click", () => autoDetectFans());
+
+// Ramp each controllable motherboard header to 100% one at a time, see whether RPM
+// responds, and mark non-responding (empty/dead) headers as "ignore". GPU fans are
+// left untouched — they stay on BIOS control.
+async function autoDetectFans() {
+  if (detecting) return;
+  optimizer.stop();
+
+  const candidates = telemetry.fans.filter(
+    (fan) => fan.source !== "gpu" && fan.controllable !== false
+  );
+  if (!candidates.length) {
+    elements.calibrationState.textContent = "No controllable motherboard fans to test";
+    return;
+  }
+
+  detecting = true;
+  elements.autoDetect.disabled = true;
+  const restore = new Map(candidates.map((fan) => [fan.id, fan.pwm]));
+
+  try {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const fan = candidates[index];
+      elements.calibrationState.textContent =
+        `Detecting ${index + 1}/${candidates.length}: ${fan.label}…`;
+
+      await adapter.setFanPwm(fan.id, 100);
+      await delay(SPINUP_SETTLE_MS);
+      const probe = await adapter.readTelemetry(loadController.getState());
+      const rpm = probe.fans.find((item) => item.id === fan.id)?.rpm ?? 0;
+
+      await adapter.setFanPwm(fan.id, restore.get(fan.id));
+
+      if (rpm < PRESENCE_RPM) {
+        await adapter.updateFan(fan.id, { role: "ignore" });
+      } else if (fan.role === "ignore") {
+        // A header that clearly has a fan shouldn't stay ignored; default it to a
+        // system fan and let the user reassign CPU if appropriate.
+        await adapter.updateFan(fan.id, { role: "case" });
+      }
+    }
+  } finally {
+    detecting = false;
+    elements.autoDetect.disabled = false;
+    telemetry = await adapter.readTelemetry(loadController.getState());
+    renderAll();
+  }
+}
+
 document.querySelectorAll("[data-load]").forEach((button) => {
   button.addEventListener("click", () => {
     loadController.start(button.dataset.load);
@@ -471,9 +544,14 @@ document.querySelectorAll("[data-load]").forEach((button) => {
 
 async function initializeAdapter() {
   const requested = new URLSearchParams(location.search).get("adapter");
-  const candidates = requested === "pawnio"
-    ? [new PawnIoAdapter(), new BrowserSimAdapter()]
-    : [new BrowserSimAdapter()];
+  // Default: try the real hardware bridge first, fall back to the simulator.
+  // ?adapter=sim forces simulation; ?adapter=pawnio forces the bridge (no fallback,
+  // so a connection failure is visible in the status line).
+  const candidates = requested === "sim"
+    ? [new BrowserSimAdapter()]
+    : requested === "pawnio"
+      ? [new PawnIoAdapter()]
+      : [new PawnIoAdapter(), new BrowserSimAdapter()];
 
   for (const candidate of candidates) {
     try {
@@ -496,7 +574,13 @@ function renderAll() {
   elements.gpuTemp.textContent = telemetry ? telemetry.sensors.gpuTempC.toFixed(1) : "--";
   elements.caseTemp.textContent = telemetry ? telemetry.sensors.caseTempC.toFixed(1) : "--";
   elements.optimizerMode.textContent = optimizer.mode === "optimizing" ? "Optimizing" : "Idle";
-  elements.calibrationState.textContent = telemetry?.fans.every((fan) => fan.label && fan.role) ? "Ready" : "Needs labels";
+  const detectedFans = telemetry?.fans ?? [];
+  const optimizedFans = detectedFans.filter(isOptimized);
+  if (!detecting) {
+    elements.calibrationState.textContent =
+      `${optimizedFans.length}/${detectedFans.length} fans optimized` +
+      (optimizedFans.length === 0 ? " — none assigned" : "");
+  }
   elements.profileJson.value = JSON.stringify(profile, null, 2);
   renderFans();
   renderCurves();
@@ -521,10 +605,11 @@ function renderFans() {
     const roleLabel = document.createElement("label");
     roleLabel.textContent = "Role";
     const role = document.createElement("select");
-    for (const option of ["cpu", "case"]) {
+    const roleLabels = { cpu: "CPU cooler", case: "System fan", ignore: "Ignore (GPU/BIOS)" };
+    for (const option of ["cpu", "case", "ignore"]) {
       const item = document.createElement("option");
       item.value = option;
-      item.textContent = option === "cpu" ? "CPU cooler" : "System fan";
+      item.textContent = roleLabels[option];
       item.selected = fan.role === option;
       role.append(item);
     }
@@ -537,7 +622,7 @@ function renderFans() {
 
     const meta = document.createElement("div");
     meta.className = "fan-meta";
-    meta.innerHTML = `<span>${fan.id}</span><span>${fan.pwm}% PWM</span><span>${fan.rpm} RPM</span>`;
+    meta.innerHTML = `<span>${fan.source ?? "?"}</span><span>${fan.pwm}% PWM</span><span>${fan.rpm} RPM</span><span>${fan.controllable === false ? "read-only" : fan.id}</span>`;
 
     const actions = document.createElement("div");
     actions.className = "fan-actions";
