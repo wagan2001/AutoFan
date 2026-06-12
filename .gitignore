@@ -9,6 +9,7 @@ bridge/obj/
 # Bridge runtime state (generated per-machine)
 bridge/fan-config.json
 bridge/lhm-report.txt
+bridge/fanbridge-log.txt
 
 # Exported fan profiles (per-machine results)
 outputs/

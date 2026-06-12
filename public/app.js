@@ -12,7 +12,10 @@ const PRESENCE_RPM = 200;
 const SPINUP_SETTLE_MS = 2500;
 
 class PawnIoAdapter {
-  constructor(endpoint = "http://127.0.0.1:9876") {
+  // In the desktop app the UI is served by the bridge itself, so API calls are
+  // same-origin relative URLs. When developing the UI from another origin (e.g. the
+  // old Node dev server), fall back to the bridge's fixed address.
+  constructor(endpoint = location.port === "9876" ? "" : "http://127.0.0.1:9876") {
     this.name = "PawnIO bridge adapter";
     this.endpoint = endpoint;
   }
@@ -72,6 +75,12 @@ class LoadController {
 
     if (this.gpuFrame) cancelAnimationFrame(this.gpuFrame);
     this.gpuFrame = 0;
+    if (this.gl) {
+      // Drop the high-resolution backing buffer when the load stops.
+      this.canvas.width = 480;
+      this.canvas.height = 240;
+      this.gl = null;
+    }
     this.mode = "idle";
   }
 
@@ -93,6 +102,11 @@ class LoadController {
   }
 
   startGpuLoad() {
+    // Render at a high backing resolution with a heavy fragment shader, several
+    // passes per frame, so the GPU is saturated instead of idling at vsync. The
+    // canvas CSS size is unchanged — only the internal buffer grows.
+    this.canvas.width = 1920;
+    this.canvas.height = 1080;
     const gl = this.canvas.getContext("webgl2") || this.canvas.getContext("webgl");
     if (!gl) return;
     this.gl = gl;
@@ -106,15 +120,22 @@ class LoadController {
     const fragment = createShader(gl, gl.FRAGMENT_SHADER, `
       precision highp float;
       uniform float time;
+      uniform float pass;
       void main() {
-        vec2 uv = gl_FragCoord.xy / vec2(480.0, 240.0);
+        vec2 uv = gl_FragCoord.xy / vec2(1920.0, 1080.0);
         vec3 color = vec3(0.0);
         float v = 0.0;
-        for (int i = 0; i < 96; i++) {
-          float f = float(i);
-          vec2 p = uv - vec2(0.5 + sin(time * 0.001 + f) * 0.12, 0.5 + cos(time * 0.0017 + f) * 0.12);
-          v += 0.004 / max(dot(p, p), 0.0004);
+        for (int i = 0; i < 220; i++) {
+          float f = float(i) + pass * 13.7;
+          vec2 p = uv - vec2(0.5 + sin(time * 0.001 + f) * 0.14, 0.5 + cos(time * 0.0017 + f) * 0.14);
+          float d = max(dot(p, p), 0.0004);
+          v += 0.004 / d;
+          // Extra transcendental work per tap keeps the ALUs busy, not just the
+          // rasterizer.
+          float w = sin(d * 41.0 + time * 0.002 + f) * cos(d * 29.0 - f * 0.31);
+          v += w * w * 0.002;
           color += vec3(sin(v + f * 0.07), cos(v + f * 0.03), sin(v + f * 0.11)) * 0.002;
+          color += vec3(pow(abs(sin(v * 0.5 + f)), 3.0)) * 0.0005;
         }
         gl_FragColor = vec4(color + vec3(v * 0.02, v * 0.015, v * 0.01), 1.0);
       }
@@ -128,11 +149,19 @@ class LoadController {
     gl.enableVertexAttribArray(position);
     gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
 
+    const timeUniform = gl.getUniformLocation(this.gpuProgram, "time");
+    const passUniform = gl.getUniformLocation(this.gpuProgram, "pass");
+    const PASSES_PER_FRAME = 6;
+
     const render = (time) => {
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       gl.useProgram(this.gpuProgram);
-      gl.uniform1f(gl.getUniformLocation(this.gpuProgram, "time"), time);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.uniform1f(timeUniform, time);
+      for (let pass = 0; pass < PASSES_PER_FRAME; pass += 1) {
+        gl.uniform1f(passUniform, pass);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+      gl.flush();
       this.gpuFrame = requestAnimationFrame(render);
     };
 

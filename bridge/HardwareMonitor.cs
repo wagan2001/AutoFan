@@ -15,6 +15,15 @@ internal sealed class HardwareMonitor
     private readonly Dictionary<string, FanChannel> _channels = new();
     private readonly Dictionary<string, FanConfigEntry> _config;
 
+    // Last software-commanded PWM per fan. Some BIOS/EC implementations re-arm their
+    // own smart-fan control periodically, silently overriding a one-time register
+    // write — exactly what must not happen mid heat-soak. A timer re-asserts every
+    // held value so the command sticks regardless of what the firmware does and
+    // independent of the UI's polling cadence.
+    private readonly Dictionary<string, float> _held = new();
+    private System.Threading.Timer? _holdTimer;
+    private static readonly TimeSpan HoldInterval = TimeSpan.FromSeconds(2);
+
     private ISensor? _cpuTemp;
     private ISensor? _gpuTemp;
     private ISensor? _caseTemp;
@@ -34,6 +43,24 @@ internal sealed class HardwareMonitor
         _config = FanConfigStore.Load();
         MapHardware();
         FanConfigStore.Save(_config); // persist any defaults we just filled in
+
+        _holdTimer = new System.Threading.Timer(_ => EnforceHolds(), null, HoldInterval, HoldInterval);
+    }
+
+    // Re-write every held PWM value to the hardware so firmware smart-fan re-arming
+    // cannot silently take the fans back (e.g. mid heat-soak). Cheap register writes;
+    // runs on its own timer so it does not depend on the UI polling.
+    private void EnforceHolds()
+    {
+        lock (_gate)
+        {
+            foreach (var (id, value) in _held)
+            {
+                if (!_channels.TryGetValue(id, out var channel)) continue;
+                try { channel.Control?.Control?.SetSoftware(value); }
+                catch { /* transient hardware hiccup; next tick retries */ }
+            }
+        }
     }
 
     // Walk the hardware tree once and cache the sensors we care about.
@@ -199,6 +226,7 @@ internal sealed class HardwareMonitor
 
             var value = (float)Math.Clamp(pwm, 0, 100);
             channel.Control.Control.SetSoftware(value);
+            _held[id] = value; // keep re-asserting until released (see EnforceHolds)
             return true;
         }
     }
@@ -234,6 +262,9 @@ internal sealed class HardwareMonitor
     {
         lock (_gate)
         {
+            try { _holdTimer?.Dispose(); } catch { /* already disposed */ }
+            _holdTimer = null;
+            _held.Clear();
             foreach (var channel in _channels.Values)
             {
                 try { channel.Control?.Control?.SetDefault(); } catch { /* best effort */ }

@@ -1,17 +1,37 @@
 # Automatic Fan Tuner
 
-Early prototype for an automatic fan curve optimizer. It runs as a local browser app so the CPU worker and WebGL GPU stress tests can operate without native dependencies while the hardware control layer is still being shaped.
+An automatic fan curve optimizer for Windows. Ships as a self-contained desktop
+application: a single elevated process hosts the hardware control layer
+(LibreHardwareMonitor on the PawnIO driver), a local HTTP service, and a WebView2
+window running the UI — so the CPU worker and WebGL GPU stress tests run with no
+extra dependencies.
 
-## Run
+## Run (desktop app)
+
+The app is a self-contained Windows desktop application: one elevated process hosts
+the hardware layer (LibreHardwareMonitor + PawnIO), a local service on
+`127.0.0.1:9876`, and a WebView2 window showing the UI.
 
 ```powershell
-npm start
+cd bridge
+dotnet run        # launches the desktop window (requires administrator)
 ```
 
-Open `http://localhost:4173`.
+To produce a distributable self-contained build (no .NET install required on the
+target machine; WebView2 Runtime ships with Windows 11):
 
 ```powershell
-npm test   # simulated end-to-end optimizer verification (no hardware needed)
+cd bridge
+dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+```
+
+The output lands in `bridge/bin/Release/net8.0-windows/win-x64/publish/`.
+
+### Development without hardware
+
+```powershell
+npm start         # legacy Node static server on http://localhost:4173 (sim adapter)
+npm test          # simulated end-to-end optimizer verification (no hardware needed)
 ```
 
 ## What Works Now
@@ -64,19 +84,16 @@ version; GPU temperature only informs system (case) fan curves.
 ### Running against real hardware (Windows)
 
 1. Install the **PawnIO** driver (see the PawnIO / Fan Control documentation).
-2. Build and run the bridge **as administrator** (driver load requires elevation):
-   ```powershell
-   cd bridge
-   dotnet run
-   ```
-   It listens on `http://127.0.0.1:9876` and prints the detected fan channels.
-3. In another terminal, start the web app and open the PawnIO entry point:
-   ```powershell
-   npm start
-   ```
-   Open `http://localhost:4173/?adapter=pawnio`. The status line shows the bridge
-   connected with N controllable fans. (Plain `http://localhost:4173` tries the bridge
-   first and falls back to the simulator; `?adapter=sim` forces simulation.)
+2. Launch the desktop app **as administrator** (the manifest requests elevation
+   automatically). It detects fan channels, writes `lhm-report.txt` and
+   `fanbridge-log.txt` next to the executable, and opens the UI window.
+3. The UI is also reachable from any browser at `http://127.0.0.1:9876` while the app
+   is running (`?adapter=sim` forces the simulator).
+
+**BIOS override protection:** every software PWM command is held and re-asserted every
+2 seconds at the hardware layer, so firmware smart-fan re-arming cannot silently take
+back control during heat soak or measurement. Holds are released (fans return to BIOS
+control) when the app exits.
 
 **Calibration:** use a fan's **100% / 0%** buttons to spin a physical fan up/down so you
 can identify it, then set its label and role. Labels/roles persist to
