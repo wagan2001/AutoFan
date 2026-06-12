@@ -14,6 +14,14 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const PRESENCE_RPM = 200;
 const SPINUP_SETTLE_MS = 2500;
 
+// Curve visualizer constants (declared here so renderAll, which runs once at module
+// load before the listeners attach, can call renderCurveChart without hitting a
+// temporal dead zone).
+const CURVE_COLORS = ["#41c7a3", "#f0b84b", "#6aa9ff", "#ef6868", "#b07fe8", "#7fe8c9", "#e8a07f"];
+
+const escapeSvg = (text) =>
+  String(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
 class PawnIoAdapter {
   // In the desktop app the UI is served by the bridge itself, so API calls are
   // same-origin relative URLs. When developing the UI from another origin (e.g. the
@@ -755,11 +763,6 @@ function renderAll() {
 }
 
 // ----- Curve visualizer ------------------------------------------------------------
-
-const CURVE_COLORS = ["#41c7a3", "#f0b84b", "#6aa9ff", "#ef6868", "#b07fe8", "#7fe8c9", "#e8a07f"];
-
-const escapeSvg = (text) =>
-  String(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
 // Draws every optimized fan's universal curve (PWM vs. temperature) plus a live
 // marker at the current CPU temperature.
