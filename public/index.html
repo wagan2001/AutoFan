@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Automatic Fan Tuner</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>Automatic Fan Tuner</h1>
+          <p id="adapter-status">Initializing hardware adapter...</p>
+        </div>
+        <div class="actions">
+          <button id="start-optimizer" type="button">Start Optimizer</button>
+          <button id="stop-all" type="button" class="secondary">Stop</button>
+          <button id="export-profile" type="button" class="secondary">Export JSON</button>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <header>
+            <h2>Calibration</h2>
+            <span id="calibration-state">Not calibrated</span>
+          </header>
+          <div id="fan-list" class="fan-list"></div>
+        </article>
+
+        <article class="panel">
+          <header>
+            <h2>Load Tests</h2>
+            <span id="load-state">Idle</span>
+          </header>
+          <div class="load-buttons">
+            <button data-load="cpu" type="button">CPU Load</button>
+            <button data-load="gpu" type="button">GPU Load</button>
+            <button data-load="system" type="button">System Load</button>
+          </div>
+          <canvas id="gpu-canvas" width="480" height="240" aria-label="GPU load canvas"></canvas>
+        </article>
+
+        <article class="panel wide">
+          <header>
+            <h2>Thermal Debug</h2>
+            <span id="sample-count">0 samples</span>
+          </header>
+          <div class="metrics">
+            <div><strong id="cpu-temp">--</strong><span>CPU C</span></div>
+            <div><strong id="gpu-temp">--</strong><span>GPU C</span></div>
+            <div><strong id="case-temp">--</strong><span>Case C</span></div>
+            <div><strong id="optimizer-mode">Idle</strong><span>Mode</span></div>
+          </div>
+          <div id="curve-grid" class="curve-grid"></div>
+        </article>
+
+        <article class="panel wide">
+          <header>
+            <h2>Profile JSON</h2>
+            <span>Live generated</span>
+          </header>
+          <textarea id="profile-json" spellcheck="false"></textarea>
+        </article>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

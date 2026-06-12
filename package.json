@@ -1,0 +1,11 @@
+{
+  "name": "automatic-fan-tuner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Early automatic fan curve optimizer with synthetic load tests, calibration flow, JSON fan profiles, and hardware adapter boundaries.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check public/cpu-worker.js"
+  }
+}
