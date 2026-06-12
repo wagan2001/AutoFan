@@ -10,6 +10,10 @@ npm start
 
 Open `http://localhost:4173`.
 
+```powershell
+npm test   # simulated end-to-end optimizer verification (no hardware needed)
+```
+
 ## What Works Now
 
 - Synthetic CPU load through Web Workers.
@@ -19,7 +23,11 @@ Open `http://localhost:4173`.
 - Fan labeling and CPU/system role assignment.
 - Real-time optimizer loop that samples telemetry, adjusts PWM, and records scenario points.
 - Universal JSON profile generation by merging CPU, GPU, and system scenario curves.
-- Local profile persistence through browser storage and JSON export.
+- Local profile persistence through browser storage and JSON export — learned scenario
+  points are rehydrated on reload, so optimization progress survives page refreshes.
+- Live optimizer activity log and learned-point counters, so you can watch every PWM
+  decision and confirm scenario data is being captured.
+- Auto-detect sweep that finds which fan headers actually have fans connected.
 
 ## Hardware Boundary
 

@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check public/cpu-worker.js"
+    "test": "node test/optimizer.test.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check public/optimizer.js && node --check public/sim-adapter.js && node --check public/cpu-worker.js"
   }
 }

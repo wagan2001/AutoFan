@@ -10,6 +10,9 @@ bridge/obj/
 bridge/fan-config.json
 bridge/lhm-report.txt
 
+# Exported fan profiles (per-machine results)
+outputs/
+
 # OS / editor
 .DS_Store
 Thumbs.db

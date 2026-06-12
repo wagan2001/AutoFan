@@ -1,13 +1,7 @@
+import { FanOptimizer, SAMPLE_INTERVAL_MS, clamp, isOptimized } from "./optimizer.js";
+import { BrowserSimAdapter } from "./sim-adapter.js";
+
 const FAN_PROFILE_KEY = "automatic-fan-tuner-profile-v1";
-const SAMPLE_INTERVAL_MS = 1000;
-
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-const round = (value, places = 1) => Number(value.toFixed(places));
-
-// Only motherboard/EC fans are optimization targets. GPU fans (and anything the user
-// marks "ignore") are left to BIOS control, matching the project's scope.
-const OPTIMIZED_ROLES = new Set(["cpu", "case"]);
-const isOptimized = (fan) => OPTIMIZED_ROLES.has(fan.role);
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -15,80 +9,6 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // header (or a dead one) stays at ~0 RPM, so this threshold separates the two.
 const PRESENCE_RPM = 200;
 const SPINUP_SETTLE_MS = 2500;
-
-class BrowserSimAdapter {
-  constructor() {
-    this.name = "Browser simulation adapter";
-    this.lastUpdate = performance.now();
-    this.fans = [
-      { id: "cpu_cooler", label: "CPU cooler", role: "cpu", source: "motherboard", pwm: 35, rpm: 850, minPwm: 20, maxPwm: 100 },
-      { id: "case_intake", label: "Case intake", role: "case", source: "motherboard", pwm: 30, rpm: 620, minPwm: 18, maxPwm: 100 },
-      { id: "case_exhaust", label: "Case exhaust", role: "case", source: "motherboard", pwm: 30, rpm: 650, minPwm: 18, maxPwm: 100 },
-      { id: "gpu_fan", label: "GPU fan", role: "ignore", source: "gpu", pwm: 40, rpm: 1100, minPwm: 0, maxPwm: 100 }
-    ];
-    this.temps = { cpu: 36, gpu: 34, case: 31, ambient: 23 };
-  }
-
-  async connect() {
-    return {
-      adapter: this.name,
-      fans: this.fans.map((fan) => ({ ...fan })),
-      capabilities: ["readSensors", "setFanPwm", "syntheticTelemetry"]
-    };
-  }
-
-  async setFanPwm(fanId, pwm) {
-    const fan = this.fans.find((item) => item.id === fanId);
-    if (!fan) return;
-    fan.pwm = pwm === 0 ? 0 : clamp(pwm, fan.minPwm, fan.maxPwm);
-    fan.rpm = fan.pwm === 0 ? 0 : Math.round(220 + fan.pwm * 22 + Math.random() * 35);
-  }
-
-  async updateFan(fanId, patch) {
-    const fan = this.fans.find((item) => item.id === fanId);
-    if (!fan) return;
-    Object.assign(fan, patch);
-  }
-
-  async readTelemetry(load) {
-    const now = performance.now();
-    const dt = clamp((now - this.lastUpdate) / 1000, 0.1, 2);
-    this.lastUpdate = now;
-
-    const cpuLoad = load.cpu ? 1 : 0.08;
-    const gpuLoad = load.gpu ? 1 : 0.06;
-    const cpuFan = this.fanByRole("cpu");
-    const caseFans = this.fans.filter((fan) => fan.role === "case");
-    const casePwm = average(caseFans.map((fan) => fan.pwm), 30);
-
-    const cpuTarget = this.temps.ambient + 13 + cpuLoad * 61 - cpuFan.pwm * 0.43 - casePwm * 0.07;
-    const gpuTarget = this.temps.ambient + 11 + gpuLoad * 56 - casePwm * 0.22;
-    const caseTarget = this.temps.ambient + 7 + cpuLoad * 8 + gpuLoad * 13 - casePwm * 0.16;
-
-    this.temps.cpu += (cpuTarget - this.temps.cpu) * 0.05 * dt;
-    this.temps.gpu += (gpuTarget - this.temps.gpu) * 0.045 * dt;
-    this.temps.case += (caseTarget - this.temps.case) * 0.035 * dt;
-
-    for (const fan of this.fans) {
-      fan.rpm = fan.pwm === 0 ? 0 : Math.round(220 + fan.pwm * 22 + Math.random() * 45);
-    }
-
-    return {
-      timestamp: new Date().toISOString(),
-      sensors: {
-        cpuTempC: round(this.temps.cpu + noise(0.25)),
-        gpuTempC: round(this.temps.gpu + noise(0.25)),
-        caseTempC: round(this.temps.case + noise(0.18)),
-        ambientTempC: this.temps.ambient
-      },
-      fans: this.fans.map((fan) => ({ ...fan }))
-    };
-  }
-
-  fanByRole(role) {
-    return this.fans.find((fan) => fan.role === role) || this.fans[0];
-  }
-}
 
 class PawnIoAdapter {
   constructor(endpoint = "http://127.0.0.1:9876") {
@@ -219,182 +139,6 @@ class LoadController {
   }
 }
 
-class FanOptimizer {
-  constructor() {
-    this.mode = "idle";
-    this.samples = [];
-    this.scenarios = {
-      cpu: new Map(),
-      gpu: new Map(),
-      system: new Map()
-    };
-    this.targets = {
-      cpuTempC: 78,
-      gpuTempC: 82,
-      caseTempC: 46
-    };
-  }
-
-  start() {
-    this.mode = "optimizing";
-  }
-
-  stop() {
-    this.mode = "idle";
-  }
-
-  recommend(telemetry, loadState) {
-    const previous = this.samples.at(-1);
-    const sample = {
-      ...telemetry,
-      loadMode: loadState.mode,
-      slopes: previous ? slopes(previous, telemetry) : { cpu: 0, gpu: 0, case: 0 }
-    };
-    this.samples.push(sample);
-    if (this.samples.length > 900) this.samples.shift();
-
-    const recommendations = telemetry.fans.filter(isOptimized).map((fan) => {
-      const sourceTemp = fan.role === "cpu"
-        ? telemetry.sensors.cpuTempC
-        : Math.max(telemetry.sensors.caseTempC + 12, telemetry.sensors.cpuTempC - 10, telemetry.sensors.gpuTempC - 8);
-      const slope = fan.role === "cpu" ? sample.slopes.cpu : Math.max(sample.slopes.case, sample.slopes.gpu * 0.5);
-      const target = fan.role === "cpu" ? this.targets.cpuTempC : this.targets.caseTempC + 12;
-      const base = curvePwm(sourceTemp, defaultCurve(fan.role));
-      const heatPenalty = clamp((sourceTemp - target + 8) * 2.7, -12, 30);
-      const slopePenalty = clamp(slope * 85, -8, 22);
-      const nextPwm = clamp(base + heatPenalty + slopePenalty, fan.minPwm, fan.maxPwm);
-      const steppedPwm = clamp(fan.pwm + clamp(nextPwm - fan.pwm, -6, 8), fan.minPwm, fan.maxPwm);
-
-      if (loadState.mode !== "idle") {
-        this.captureScenarioPoint(loadState.mode, fan.id, sourceTemp, steppedPwm);
-      }
-
-      return { fanId: fan.id, pwm: Math.round(steppedPwm) };
-    });
-
-    return recommendations;
-  }
-
-  captureScenarioPoint(mode, fanId, temp, pwm) {
-    const scenario = this.scenarios[mode];
-    if (!scenario) return;
-
-    const bucket = Math.round(temp / 5) * 5;
-    const key = `${fanId}:${bucket}`;
-    const existing = scenario.get(key);
-    const next = existing ? Math.max(existing, pwm) : pwm;
-    scenario.set(key, Math.round(next));
-  }
-
-  buildProfile(fans) {
-    const generatedAt = new Date().toISOString();
-    const fanProfiles = fans.filter(isOptimized).map((fan) => ({
-      id: fan.id,
-      label: fan.label,
-      role: fan.role,
-      minPwm: fan.minPwm,
-      maxPwm: fan.maxPwm,
-      curve: mergeCurves(fan, this.scenarios)
-    }));
-
-    return {
-      schemaVersion: 1,
-      generatedAt,
-      adapter: {
-        preferred: "pawnio",
-        fallback: "browser-sim",
-        bridgeEndpoint: "http://127.0.0.1:9876"
-      },
-      optimizer: {
-        objective: "keep CPU, GPU-influenced case temperature, and case sensors under target with lowest stable PWM",
-        targets: this.targets,
-        sampleIntervalMs: SAMPLE_INTERVAL_MS,
-        scenarios: ["cpu", "gpu", "system"]
-      },
-      fans: fanProfiles,
-      rawScenarioPoints: serializeScenarioPoints(this.scenarios)
-    };
-  }
-}
-
-function defaultCurve(role) {
-  if (role === "cpu") {
-    return [
-      { tempC: 30, pwm: 22 },
-      { tempC: 45, pwm: 32 },
-      { tempC: 60, pwm: 52 },
-      { tempC: 75, pwm: 78 },
-      { tempC: 88, pwm: 100 }
-    ];
-  }
-
-  return [
-    { tempC: 28, pwm: 20 },
-    { tempC: 38, pwm: 30 },
-    { tempC: 48, pwm: 48 },
-    { tempC: 62, pwm: 72 },
-    { tempC: 76, pwm: 100 }
-  ];
-}
-
-function mergeCurves(fan, scenarios) {
-  const base = defaultCurve(fan.role);
-  const temps = [...new Set([...base.map((point) => point.tempC), 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85])].sort((a, b) => a - b);
-  let last = fan.minPwm;
-
-  return temps.map((tempC) => {
-    const learned = ["cpu", "gpu", "system"].map((mode) => {
-      const points = scenarios[mode];
-      return points.get(`${fan.id}:${Math.round(tempC / 5) * 5}`) ?? 0;
-    });
-    const pwm = clamp(Math.max(curvePwm(tempC, base), ...learned, last), fan.minPwm, fan.maxPwm);
-    last = pwm;
-    return { tempC, pwm: Math.round(pwm) };
-  });
-}
-
-function curvePwm(temp, curve) {
-  if (temp <= curve[0].tempC) return curve[0].pwm;
-  for (let index = 1; index < curve.length; index += 1) {
-    const left = curve[index - 1];
-    const right = curve[index];
-    if (temp <= right.tempC) {
-      const t = (temp - left.tempC) / (right.tempC - left.tempC);
-      return left.pwm + (right.pwm - left.pwm) * t;
-    }
-  }
-  return curve.at(-1).pwm;
-}
-
-function serializeScenarioPoints(scenarios) {
-  const output = {};
-  for (const [mode, points] of Object.entries(scenarios)) {
-    output[mode] = [...points.entries()].map(([key, pwm]) => {
-      const [fanId, tempC] = key.split(":");
-      return { fanId, tempC: Number(tempC), pwm };
-    });
-  }
-  return output;
-}
-
-function slopes(previous, current) {
-  const seconds = Math.max(0.1, (Date.parse(current.timestamp) - Date.parse(previous.timestamp)) / 1000);
-  return {
-    cpu: (current.sensors.cpuTempC - previous.sensors.cpuTempC) / seconds,
-    gpu: (current.sensors.gpuTempC - previous.sensors.gpuTempC) / seconds,
-    case: (current.sensors.caseTempC - previous.sensors.caseTempC) / seconds
-  };
-}
-
-function average(values, fallback) {
-  if (!values.length) return fallback;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
-
-function noise(range) {
-  return (Math.random() - 0.5) * range;
-}
-
 function createShader(gl, type, source) {
   const shader = gl.createShader(type);
   gl.shaderSource(shader, source);
@@ -426,6 +170,8 @@ const elements = {
   gpuTemp: document.querySelector("#gpu-temp"),
   caseTemp: document.querySelector("#case-temp"),
   optimizerMode: document.querySelector("#optimizer-mode"),
+  scenarioPoints: document.querySelector("#scenario-points"),
+  optimizerLog: document.querySelector("#optimizer-log"),
   curveGrid: document.querySelector("#curve-grid"),
   profileJson: document.querySelector("#profile-json"),
   startOptimizer: document.querySelector("#start-optimizer"),
@@ -439,11 +185,30 @@ const elements = {
 // calibration status line or write PWM.
 let detecting = false;
 
+const activityLog = [];
+
+function logActivity(message) {
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  activityLog.unshift(`${time}  ${message}`);
+  if (activityLog.length > 80) activityLog.pop();
+  elements.optimizerLog.textContent = activityLog.join("\n");
+}
+
 const loadController = new LoadController(elements.gpuCanvas);
 const optimizer = new FanOptimizer();
 const adapter = await initializeAdapter();
 let telemetry = await adapter.readTelemetry(loadController.getState());
-let profile = loadProfile() || optimizer.buildProfile(telemetry.fans);
+
+// Restore learned scenario points from the last session so a reload doesn't wipe
+// everything the optimizer recorded.
+const savedProfile = loadProfile();
+if (savedProfile?.rawScenarioPoints) {
+  optimizer.hydrate(savedProfile.rawScenarioPoints);
+  const counts = optimizer.scenarioCounts();
+  const restored = counts.cpu + counts.gpu + counts.system;
+  if (restored > 0) logActivity(`Restored ${restored} learned scenario points from the previous session`);
+}
+let profile = optimizer.buildProfile(telemetry.fans);
 
 renderAll();
 
@@ -452,8 +217,21 @@ setInterval(async () => {
   telemetry = await adapter.readTelemetry(loadController.getState());
 
   if (optimizer.mode === "optimizing") {
-    const recommendations = optimizer.recommend(telemetry, loadController.getState());
+    const loadState = loadController.getState();
+    const before = new Map(telemetry.fans.map((fan) => [fan.id, fan.pwm]));
+    const labels = new Map(telemetry.fans.map((fan) => [fan.id, fan.label]));
+    const recommendations = optimizer.recommend(telemetry, loadState);
     await Promise.all(recommendations.map((item) => adapter.setFanPwm(item.fanId, item.pwm)));
+
+    const changed = recommendations.filter((item) => Math.round(before.get(item.fanId) ?? -1) !== item.pwm);
+    if (changed.length) {
+      const moves = changed
+        .map((item) => `${labels.get(item.fanId) ?? item.fanId} ${Math.round(before.get(item.fanId))}→${item.pwm}%`)
+        .join(" · ");
+      const scenario = loadState.mode !== "idle" ? ` [learning ${loadState.mode}]` : "";
+      logActivity(`${moves} — CPU ${telemetry.sensors.cpuTempC.toFixed(1)}°C${scenario}`);
+    }
+
     telemetry = await adapter.readTelemetry(loadController.getState());
   }
 
@@ -464,15 +242,21 @@ setInterval(async () => {
 
 elements.startOptimizer.addEventListener("click", () => {
   optimizer.start();
+  const loadState = loadController.getState();
+  logActivity(loadState.mode === "idle"
+    ? "Optimizer started — start a load test to record scenario curves"
+    : `Optimizer started — learning ${loadState.mode} scenario`);
   renderAll();
 });
 
 elements.stopAll.addEventListener("click", async () => {
   optimizer.stop();
   loadController.stop();
-  for (const fan of telemetry.fans) {
+  // Only park fans we manage; GPU/ignored fans stay on BIOS control.
+  for (const fan of telemetry.fans.filter(isOptimized)) {
     await adapter.setFanPwm(fan.id, Math.max(fan.minPwm, 30));
   }
+  logActivity("Stopped — optimizer idle, loads off, managed fans parked at 30%");
   renderAll();
 });
 
@@ -483,6 +267,8 @@ elements.exportProfile.addEventListener("click", () => {
   link.download = `fan-profile-${new Date().toISOString().replaceAll(":", "-")}.json`;
   link.click();
   URL.revokeObjectURL(link.href);
+  const counts = optimizer.scenarioCounts();
+  logActivity(`Exported profile (${counts.cpu} cpu / ${counts.gpu} gpu / ${counts.system} system learned points)`);
 });
 
 elements.autoDetect.addEventListener("click", () => autoDetectFans());
@@ -505,6 +291,7 @@ async function autoDetectFans() {
   detecting = true;
   elements.autoDetect.disabled = true;
   const restore = new Map(candidates.map((fan) => [fan.id, fan.pwm]));
+  let connected = 0;
 
   try {
     for (let index = 0; index < candidates.length; index += 1) {
@@ -521,12 +308,16 @@ async function autoDetectFans() {
 
       if (rpm < PRESENCE_RPM) {
         await adapter.updateFan(fan.id, { role: "ignore" });
-      } else if (fan.role === "ignore") {
-        // A header that clearly has a fan shouldn't stay ignored; default it to a
-        // system fan and let the user reassign CPU if appropriate.
-        await adapter.updateFan(fan.id, { role: "case" });
+      } else {
+        connected += 1;
+        if (fan.role === "ignore") {
+          // A header that clearly has a fan shouldn't stay ignored; default it to a
+          // system fan and let the user reassign CPU if appropriate.
+          await adapter.updateFan(fan.id, { role: "case" });
+        }
       }
     }
+    logActivity(`Auto-detect finished: ${connected}/${candidates.length} headers have fans connected`);
   } finally {
     detecting = false;
     elements.autoDetect.disabled = false;
@@ -537,7 +328,14 @@ async function autoDetectFans() {
 
 document.querySelectorAll("[data-load]").forEach((button) => {
   button.addEventListener("click", () => {
-    loadController.start(button.dataset.load);
+    const mode = button.dataset.load;
+    if (loadController.mode === mode) {
+      loadController.stop();
+      logActivity(`${mode.toUpperCase()} load stopped`);
+    } else {
+      loadController.start(mode);
+      logActivity(`${mode.toUpperCase()} load started${optimizer.mode === "optimizing" ? ` — learning ${mode} scenario` : ""}`);
+    }
     renderAll();
   });
 });
@@ -570,10 +368,29 @@ function renderAll() {
   const loadState = loadController.getState();
   elements.loadState.textContent = loadState.mode === "idle" ? "Idle" : `${loadState.mode.toUpperCase()} load running`;
   elements.sampleCount.textContent = `${optimizer.samples.length} samples`;
-  elements.cpuTemp.textContent = telemetry ? telemetry.sensors.cpuTempC.toFixed(1) : "--";
-  elements.gpuTemp.textContent = telemetry ? telemetry.sensors.gpuTempC.toFixed(1) : "--";
-  elements.caseTemp.textContent = telemetry ? telemetry.sensors.caseTempC.toFixed(1) : "--";
-  elements.optimizerMode.textContent = optimizer.mode === "optimizing" ? "Optimizing" : "Idle";
+  renderMetric(elements.cpuTemp, telemetry?.sensors.cpuTempC, optimizer.targets.cpuTempC);
+  renderMetric(elements.gpuTemp, telemetry?.sensors.gpuTempC, optimizer.targets.gpuTempC);
+  renderMetric(elements.caseTemp, telemetry?.sensors.caseTempC, optimizer.targets.caseTempC);
+
+  if (optimizer.mode === "optimizing") {
+    elements.optimizerMode.textContent = loadState.mode === "idle" ? "Holding" : "Learning";
+    elements.optimizerMode.title = loadState.mode === "idle"
+      ? "Optimizer is adjusting fans but no load test is running, so no scenario data is being recorded"
+      : `Recording ${loadState.mode} scenario points`;
+  } else {
+    elements.optimizerMode.textContent = "Idle";
+    elements.optimizerMode.title = "";
+  }
+
+  const counts = optimizer.scenarioCounts();
+  elements.scenarioPoints.textContent = `${counts.cpu} · ${counts.gpu} · ${counts.system}`;
+
+  document.querySelectorAll("[data-load]").forEach((button) => {
+    button.classList.toggle("active", loadState.mode === button.dataset.load);
+  });
+  elements.startOptimizer.disabled = optimizer.mode === "optimizing";
+  elements.startOptimizer.textContent = optimizer.mode === "optimizing" ? "Optimizing…" : "Start Optimizer";
+
   const detectedFans = telemetry?.fans ?? [];
   const optimizedFans = detectedFans.filter(isOptimized);
   if (!detecting) {
@@ -584,6 +401,11 @@ function renderAll() {
   elements.profileJson.value = JSON.stringify(profile, null, 2);
   renderFans();
   renderCurves();
+}
+
+function renderMetric(element, value, target) {
+  element.textContent = value === undefined || value === null ? "--" : value.toFixed(1);
+  element.classList.toggle("hot", typeof value === "number" && value > target);
 }
 
 function renderFans() {
@@ -622,7 +444,13 @@ function renderFans() {
 
     const meta = document.createElement("div");
     meta.className = "fan-meta";
-    meta.innerHTML = `<span>${fan.source ?? "?"}</span><span>${fan.pwm}% PWM</span><span>${fan.rpm} RPM</span><span>${fan.controllable === false ? "read-only" : fan.id}</span>`;
+    meta.append(
+      chip(fan.source ?? "?", `source-${fan.source ?? "unknown"}`),
+      chip(`${fan.pwm}% PWM`),
+      chip(`${fan.rpm} RPM`, fan.rpm > 0 ? "spinning" : ""),
+      chip(fan.controllable === false ? "read-only" : isOptimized(fan) ? "optimized" : "not optimized",
+        fan.controllable === false ? "" : isOptimized(fan) ? "managed" : "")
+    );
 
     const actions = document.createElement("div");
     actions.className = "fan-actions";
@@ -637,6 +465,13 @@ function renderFans() {
   }));
 }
 
+function chip(text, extraClass = "") {
+  const span = document.createElement("span");
+  span.className = `chip${extraClass ? ` ${extraClass}` : ""}`;
+  span.textContent = text;
+  return span;
+}
+
 function renderCurves() {
   elements.curveGrid.replaceChildren(...profile.fans.map((fan) => {
     const card = document.createElement("div");
@@ -647,7 +482,7 @@ function renderCurves() {
     points.className = "curve-points";
     points.replaceChildren(...fan.curve.map((point) => {
       const item = document.createElement("span");
-      item.textContent = `${point.tempC}C: ${point.pwm}%`;
+      item.textContent = `${point.tempC}° ${point.pwm}%`;
       return item;
     }));
     card.append(title, points);

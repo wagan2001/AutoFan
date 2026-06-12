@@ -51,12 +51,21 @@
             <span id="sample-count">0 samples</span>
           </header>
           <div class="metrics">
-            <div><strong id="cpu-temp">--</strong><span>CPU C</span></div>
-            <div><strong id="gpu-temp">--</strong><span>GPU C</span></div>
-            <div><strong id="case-temp">--</strong><span>Case C</span></div>
-            <div><strong id="optimizer-mode">Idle</strong><span>Mode</span></div>
+            <div><strong id="cpu-temp">--</strong><span>CPU °C</span></div>
+            <div><strong id="gpu-temp">--</strong><span>GPU °C</span></div>
+            <div><strong id="case-temp">--</strong><span>Case °C</span></div>
+            <div><strong id="optimizer-mode">Idle</strong><span>Optimizer</span></div>
+            <div><strong id="scenario-points">0 · 0 · 0</strong><span>Learned points (cpu · gpu · sys)</span></div>
           </div>
           <div id="curve-grid" class="curve-grid"></div>
+        </article>
+
+        <article class="panel wide">
+          <header>
+            <h2>Optimizer Activity</h2>
+            <span>Live PWM decisions and scenario learning</span>
+          </header>
+          <pre id="optimizer-log" class="log">Waiting for activity…</pre>
         </article>
 
         <article class="panel wide">
