@@ -202,6 +202,7 @@ const elements = {
   optimizerMode: document.querySelector("#optimizer-mode"),
   scenarioPoints: document.querySelector("#scenario-points"),
   optimizerLog: document.querySelector("#optimizer-log"),
+  curveChart: document.querySelector("#curve-chart"),
   curveGrid: document.querySelector("#curve-grid"),
   profileJson: document.querySelector("#profile-json"),
   startOptimizer: document.querySelector("#start-optimizer"),
@@ -604,7 +605,80 @@ function renderAll() {
   }
   elements.profileJson.value = JSON.stringify(profile, null, 2);
   renderFans();
+  renderCurveChart();
   renderCurves();
+}
+
+// ----- Curve visualizer ------------------------------------------------------------
+
+const CURVE_COLORS = ["#41c7a3", "#f0b84b", "#6aa9ff", "#ef6868", "#b07fe8", "#7fe8c9", "#e8a07f"];
+
+const escapeSvg = (text) =>
+  String(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+// Draws every optimized fan's universal curve (PWM vs. temperature) plus a live
+// marker at the current CPU temperature.
+function renderCurveChart() {
+  const width = 860;
+  const height = 340;
+  const margin = { top: 46, right: 18, bottom: 34, left: 46 };
+  const x0 = margin.left;
+  const x1 = width - margin.right;
+  const y0 = height - margin.bottom;
+  const y1 = margin.top;
+  const tempMin = 25;
+  const tempMax = 90;
+  const xOf = (tempC) => x0 + ((tempC - tempMin) / (tempMax - tempMin)) * (x1 - x0);
+  const yOf = (pwm) => y0 - (pwm / 100) * (y0 - y1);
+
+  let svg = "";
+
+  for (let t = 30; t <= 90; t += 10) {
+    svg += `<line class="chart-grid" x1="${xOf(t)}" y1="${y0}" x2="${xOf(t)}" y2="${y1}"/>`;
+    svg += `<text class="chart-axis" x="${xOf(t)}" y="${y0 + 18}" text-anchor="middle">${t}°</text>`;
+  }
+  for (let p = 0; p <= 100; p += 20) {
+    svg += `<line class="chart-grid" x1="${x0}" y1="${yOf(p)}" x2="${x1}" y2="${yOf(p)}"/>`;
+    svg += `<text class="chart-axis" x="${x0 - 8}" y="${yOf(p) + 4}" text-anchor="end">${p}%</text>`;
+  }
+
+  // Live marker: where the CPU is right now.
+  const cpuNow = telemetry?.sensors.cpuTempC;
+  if (typeof cpuNow === "number" && cpuNow >= tempMin && cpuNow <= tempMax) {
+    svg += `<line class="chart-marker" x1="${xOf(cpuNow)}" y1="${y0}" x2="${xOf(cpuNow)}" y2="${y1}"/>`;
+    svg += `<text class="chart-marker-label" x="${xOf(cpuNow) + 5}" y="${y1 + 12}">CPU ${cpuNow.toFixed(1)}°</text>`;
+  }
+
+  profile.fans.forEach((fan, index) => {
+    const color = CURVE_COLORS[index % CURVE_COLORS.length];
+    const visible = fan.curve.filter((point) => point.tempC >= tempMin && point.tempC <= tempMax);
+    if (!visible.length) return;
+
+    const points = visible.map((point) => `${xOf(point.tempC).toFixed(1)},${yOf(point.pwm).toFixed(1)}`).join(" ");
+    svg += `<polyline class="chart-line" points="${points}" stroke="${color}"/>`;
+    for (const point of visible) {
+      svg += `<circle class="chart-dot" cx="${xOf(point.tempC).toFixed(1)}" cy="${yOf(point.pwm).toFixed(1)}" r="3" fill="${color}"/>`;
+    }
+
+    // Current PWM dot for this fan, placed at its live duty on the curve's x-extent.
+    const live = telemetry?.fans.find((item) => item.id === fan.id);
+    if (live && typeof cpuNow === "number" && cpuNow >= tempMin && cpuNow <= tempMax) {
+      svg += `<circle class="chart-live" cx="${xOf(cpuNow).toFixed(1)}" cy="${yOf(live.pwm).toFixed(1)}" r="5" stroke="${color}"/>`;
+    }
+
+    // Legend (wraps onto a second row when there are many fans).
+    const legendX = x0 + (index % 4) * 200;
+    const legendY = 16 + Math.floor(index / 4) * 18;
+    const roleText = fan.role === "cpu" ? "CPU" : "System";
+    svg += `<rect x="${legendX}" y="${legendY - 9}" width="14" height="4" rx="2" fill="${color}"/>`;
+    svg += `<text class="chart-legend" x="${legendX + 20}" y="${legendY}">${escapeSvg(fan.label)} · ${roleText}</text>`;
+  });
+
+  if (!profile.fans.length) {
+    svg += `<text class="chart-axis" x="${(x0 + x1) / 2}" y="${(y0 + y1) / 2}" text-anchor="middle">No optimized fans — assign CPU/System roles in Calibration</text>`;
+  }
+
+  elements.curveChart.innerHTML = svg;
 }
 
 function renderMetric(element, value, target) {

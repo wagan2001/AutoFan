@@ -269,6 +269,55 @@ label {
   margin-bottom: 14px;
 }
 
+#curve-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0d1117;
+}
+
+.chart-grid {
+  stroke: #232a33;
+  stroke-width: 1;
+}
+
+.chart-axis {
+  fill: var(--muted);
+  font-size: 12px;
+}
+
+.chart-line {
+  fill: none;
+  stroke-width: 2.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-live {
+  fill: none;
+  stroke-width: 2;
+}
+
+.chart-marker {
+  stroke: var(--danger);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 4;
+  opacity: 0.8;
+}
+
+.chart-marker-label {
+  fill: var(--danger);
+  font-size: 12px;
+}
+
+.chart-legend {
+  fill: var(--text);
+  font-size: 13px;
+}
+
 .metrics div {
   padding: 14px;
   background: var(--panel-2);
