@@ -48,10 +48,17 @@ npm test          # simulated end-to-end optimizer verification (no hardware nee
 - Live optimizer activity log and learned-point counters, so you can watch every PWM
   decision and confirm scenario data is being captured.
 - Auto-detect sweep that finds which fan headers actually have fans connected.
-- One-click **Auto-Optimize**: runs CPU → GPU → full-system scenarios automatically,
-  each with a heat-soak phase (load on, nothing recorded until temperatures flatten),
-  a measurement phase, and a cooldown — with a progress bar, time-remaining estimate,
-  and a safety cutoff that ramps fans to 100% if the CPU approaches its limit.
+- One-click **Auto-Optimize** with calibrated measurement: each scenario first
+  **holds the component at its temperature target** (a per-group hold controller
+  rides the target so heat soaks into heatpipes/fins/coolant), then runs a
+  **dissipation staircase** — PWM stepped up gently, measuring the steady
+  temperature at each level — building a real map of how the hardware dissipates
+  heat. Curves are anchored at the lowest PWM measured to hold the target, so
+  thermally dense parts (e.g. X3D CPUs) get quiet curves instead of pointless 100%
+  panic. Progress bar, time-remaining estimate, and CPU+GPU safety cutoffs included.
+- **GPU fan control**: GPU fans are first-class (role "GPU cooler") with their own
+  temperature target, held and measured like the CPU, and exported with NvAPI
+  enabled in FanControl configs.
 - Detailed fan types that shape the optimization: CPU coolers are Air or AIO (AIO
   control is damped to account for coolant thermal lag); case fans are CPU intake,
   GPU intake, or Exhaust (each follows the temperature source it actually serves).

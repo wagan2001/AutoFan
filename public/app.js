@@ -1,4 +1,7 @@
-import { FanOptimizer, SAMPLE_INTERVAL_MS, clamp, isOptimized, FAN_TYPES, defaultFanType, CPU_TARGET_PRESETS } from "./optimizer.js";
+import {
+  FanOptimizer, SAMPLE_INTERVAL_MS, clamp, isOptimized, FAN_TYPES, defaultFanType,
+  CPU_TARGET_PRESETS, scenarioHoldGroups, sourceTempForFan, HOLD_ASSIST_PWM
+} from "./optimizer.js";
 import { BrowserSimAdapter } from "./sim-adapter.js";
 import { buildFanControlConfig } from "./fancontrol-export.js";
 
@@ -214,6 +217,7 @@ const elements = {
   autoStatus: document.querySelector("#auto-status"),
   autoProgress: document.querySelector("#auto-progress"),
   cpuTarget: document.querySelector("#cpu-target"),
+  gpuTarget: document.querySelector("#gpu-target"),
   gpuCanvas: document.querySelector("#gpu-canvas")
 };
 
@@ -251,10 +255,17 @@ if (savedProfile?.rawScenarioPoints) {
   const restored = counts.cpu + counts.gpu + counts.system;
   if (restored > 0) logActivity(`Restored ${restored} learned scenario points from the previous session`);
 }
+if (savedProfile?.dissipation) {
+  optimizer.hydrateDissipation(savedProfile.dissipation);
+}
 if (savedProfile?.optimizer?.targets?.cpuTempC) {
   optimizer.setCpuTarget(savedProfile.optimizer.targets.cpuTempC);
 }
+if (savedProfile?.optimizer?.targets?.gpuTempC) {
+  optimizer.setGpuTarget(savedProfile.optimizer.targets.gpuTempC);
+}
 elements.cpuTarget.value = optimizer.targets.cpuTempC;
+elements.gpuTarget.value = optimizer.targets.gpuTempC;
 let profile = optimizer.buildProfile(telemetry.fans);
 
 renderAll();
@@ -262,6 +273,12 @@ renderAll();
 setInterval(async () => {
   if (detecting) return; // the sweep owns the fans while it runs
   telemetry = await adapter.readTelemetry(loadController.getState());
+
+  // During the auto routine the hold/staircase code drives the fans, but the sample
+  // history must stay continuous for flatness/soak detection.
+  if (autoRun.active && optimizer.mode !== "optimizing") {
+    optimizer.observe(telemetry, loadController.getState());
+  }
 
   if (optimizer.mode === "optimizing") {
     const loadState = loadController.getState();
@@ -340,6 +357,13 @@ elements.cpuTarget.addEventListener("change", () => {
   renderAll();
 });
 
+elements.gpuTarget.addEventListener("change", () => {
+  const applied = optimizer.setGpuTarget(Number(elements.gpuTarget.value) || optimizer.targets.gpuTempC);
+  elements.gpuTarget.value = applied;
+  logActivity(`GPU temperature target set to ${applied}°C`);
+  renderAll();
+});
+
 document.querySelectorAll("[data-target-preset]").forEach((button) => {
   button.addEventListener("click", () => {
     const preset = button.dataset.targetPreset;
@@ -407,15 +431,22 @@ async function autoDetectFans() {
 
 // ----- One-click optimization -----------------------------------------------------
 //
-// Runs every load scenario in sequence. Each scenario gets a heat-soak phase (load on,
-// fans managed, but nothing recorded — components approach steady state within safe
-// limits) followed by a measurement phase (scenario points recorded), then a cooldown
-// before the next scenario so each one starts from a comparable baseline.
+// Runs every load scenario in sequence. Each scenario:
+//  1. Heat soak: a hold controller rides the component AT its temperature target so
+//     heat saturates heatpipes/fins/coolant — not maximum cooling.
+//  2. Dissipation staircase: PWM is stepped up gently from the hold level; at each
+//     level the steady temperature is measured, building a calibrated map of how
+//     this hardware actually dissipates heat.
+//  3. Cooldown before the next scenario so each starts from a comparable baseline.
 const AUTO_PLAN = [
-  { scenario: "cpu", soakMs: 90_000, measureMs: 120_000, cooldownMs: 60_000 },
-  { scenario: "gpu", soakMs: 90_000, measureMs: 120_000, cooldownMs: 60_000 },
-  { scenario: "system", soakMs: 120_000, measureMs: 150_000, cooldownMs: 0 }
+  { scenario: "cpu", soakMs: 270_000, measureMs: 360_000, cooldownMs: 60_000 },
+  { scenario: "gpu", soakMs: 270_000, measureMs: 360_000, cooldownMs: 60_000 },
+  { scenario: "system", soakMs: 300_000, measureMs: 420_000, cooldownMs: 0 }
 ];
+
+const STAIRCASE_STEP = 10; // PWM percent per stage
+const STAIRCASE_DWELL_MIN_S = 25; // minimum seconds at each level
+const STAIRCASE_DWELL_MAX_S = 50; // give up waiting for flatness after this
 
 const autoTotalMs = () => AUTO_PLAN.reduce((sum, step) => sum + step.soakMs + step.measureMs + step.cooldownMs, 0);
 
@@ -433,30 +464,21 @@ async function runAutoOptimization() {
   autoRun = { active: true, abort: false, doneMs: 0 };
   elements.autoOptimize.disabled = true;
   elements.autoDetect.disabled = true;
-  optimizer.start();
-  logActivity(`Auto-optimization started — ~${formatDuration(autoTotalMs())} estimated (soak → measure → cooldown per scenario)`);
+  // The routine drives fans itself (hold controller + staircase); the heuristic
+  // recommend() loop stays off and per-second bucket capture is disabled.
+  optimizer.stop();
+  optimizer.captureEnabled = false;
+  logActivity(`Auto-optimization started — ~${formatDuration(autoTotalMs())} planned (hold at target → dissipation staircase → cooldown, per scenario)`);
   const baselineCpu = telemetry.sensors.cpuTempC;
 
   try {
     for (const step of AUTO_PLAN) {
       if (autoRun.abort) break;
-      await runPhase(`Heat soak — ${step.scenario.toUpperCase()}`, step.soakMs, {
-        load: step.scenario,
-        capture: false,
-        // A soak is done early once the CPU temperature has flattened out.
-        earlyExit: () => cpuTempFlat()
-      });
+      await runHoldPhase(step);
       if (autoRun.abort) break;
-      await runPhase(`Measuring — ${step.scenario.toUpperCase()}`, step.measureMs, {
-        load: step.scenario,
-        capture: true
-      });
+      await runStaircasePhase(step);
       if (autoRun.abort || !step.cooldownMs) continue;
-      await runPhase("Cooldown", step.cooldownMs, {
-        load: "idle",
-        capture: false,
-        earlyExit: () => telemetry.sensors.cpuTempC <= baselineCpu + 6
-      });
+      await runCooldownPhase(step, baselineCpu);
     }
   } finally {
     optimizer.captureEnabled = true;
@@ -467,8 +489,8 @@ async function runAutoOptimization() {
     }
     const counts = optimizer.scenarioCounts();
     logActivity(autoRun.abort
-      ? "Auto-optimization aborted — partial scenario data kept"
-      : `Auto-optimization complete — learned points: cpu=${counts.cpu} gpu=${counts.gpu} system=${counts.system}. Universal profile rebuilt.`);
+      ? "Auto-optimization aborted — partial calibration data kept"
+      : `Auto-optimization complete — learned data: cpu=${counts.cpu} gpu=${counts.gpu} system=${counts.system}. Calibrated profile rebuilt.`);
     autoRun = { active: false, abort: false, doneMs: 0 };
     elements.autoOptimize.disabled = false;
     elements.autoDetect.disabled = false;
@@ -478,40 +500,168 @@ async function runAutoOptimization() {
   }
 }
 
-async function runPhase(label, durationMs, { load, capture, earlyExit }) {
-  if (loadController.mode !== load) {
-    if (load === "idle") loadController.stop();
-    else loadController.start(load);
+function safeLimits() {
+  return {
+    cpu: Math.min(optimizer.targets.cpuTempC + 10, 95),
+    gpu: Math.min(optimizer.targets.gpuTempC + 8, 92)
+  };
+}
+
+// Returns true (and handles the response) when a component is over its safety limit.
+async function safetyTripped(label) {
+  const limits = safeLimits();
+  const { cpuTempC, gpuTempC } = telemetry.sensors;
+  if (cpuTempC < limits.cpu && gpuTempC < limits.gpu) return false;
+  const which = cpuTempC >= limits.cpu ? `CPU ${cpuTempC.toFixed(1)}°C` : `GPU ${gpuTempC.toFixed(1)}°C`;
+  logActivity(`Safety (${label}): ${which} over limit — managed fans to 100%, ending phase`);
+  for (const fan of telemetry.fans.filter(isOptimized)) {
+    await adapter.setFanPwm(fan.id, 100);
   }
-  optimizer.captureEnabled = capture;
+  return true;
+}
+
+async function setGroupPwm(group, pwm) {
+  const fans = telemetry.fans.filter((fan) => isOptimized(fan) && fan.role === group);
+  await Promise.all(fans.map((fan) => adapter.setFanPwm(fan.id, Math.round(clamp(pwm, fan.minPwm, fan.maxPwm)))));
+}
+
+// True when every held temperature has stopped moving (steady state).
+function drivenTempsFlat(mode, seconds, band) {
+  const recent = optimizer.samples.slice(-seconds);
+  if (recent.length < seconds) return false;
+  for (const group of scenarioHoldGroups(mode)) {
+    const key = group === "cpu" ? "cpuTempC" : "gpuTempC";
+    const values = recent.map((sample) => sample.sensors[key]);
+    if (Math.max(...values) - Math.min(...values) >= band) return false;
+  }
+  return true;
+}
+
+// Phase 1: ride the component at its temperature target so heat soaks into the
+// cooler's thermal mass (heatpipes, fins, coolant). Done when it has held within
+// ±3°C for 75 s — or has clearly settled as close as this load can get it.
+async function runHoldPhase(step) {
+  const label = `Heat soak — ${step.scenario.toUpperCase()}`;
+  loadController.start(step.scenario);
+  optimizer.beginHold(telemetry);
   renderAll();
 
   const start = performance.now();
-  const safeLimitC = Math.min(optimizer.targets.cpuTempC + 10, 95);
+  let inBand = 0;
 
   while (!autoRun.abort) {
     const elapsed = performance.now() - start;
-    if (elapsed >= durationMs) break;
-    updateAutoProgress(label, elapsed, durationMs);
+    if (elapsed >= step.soakMs) break;
 
-    if (telemetry.sensors.cpuTempC >= safeLimitC) {
-      logActivity(`Safety: CPU ${telemetry.sensors.cpuTempC.toFixed(1)}°C ≥ ${safeLimitC}°C — managed fans to 100%, ending phase early`);
-      for (const fan of telemetry.fans.filter(isOptimized)) {
-        await adapter.setFanPwm(fan.id, 100);
-      }
+    const recommendations = optimizer.holdTick(telemetry, step.scenario);
+    await Promise.all(recommendations.map((item) => adapter.setFanPwm(item.fanId, item.pwm)));
+
+    const error = optimizer.holdError(telemetry, step.scenario);
+    updateAutoProgress(`${label} — holding at target (±${error.toFixed(1)}°)`, elapsed, step.soakMs);
+
+    if (await safetyTripped(label)) break;
+
+    inBand = error <= 3 ? inBand + 1 : 0;
+    if (inBand >= 75) {
+      logActivity(`${label}: soaked — held within ±3° of target for 75 s (at ${formatDuration(elapsed)})`);
       break;
     }
-    // Give every phase at least 20 s before allowing an early exit so transient
-    // flatness right after a load change can't cut a phase short.
-    if (earlyExit && elapsed > 20_000 && earlyExit()) {
-      logActivity(`${label}: finished early (condition reached at ${formatDuration(elapsed)})`);
+    // Some parts can't reach the target even at minimum airflow (e.g. a GPU whose
+    // load tops out below target). Once steady for a while, that's as soaked as it
+    // gets.
+    if (elapsed > 150_000 && error > 3 && drivenTempsFlat(step.scenario, 60, 1.2)) {
+      logActivity(`${label}: steady ${error.toFixed(1)}° away from target — treating as soaked`);
       break;
     }
     await delay(1000);
   }
 
-  // Credit the full planned duration so progress/ETA always move forward.
-  autoRun.doneMs += durationMs;
+  autoRun.doneMs += step.soakMs;
+}
+
+// Phase 2: gently step PWM upward from the hold level and measure the steady
+// temperature at each level — the dissipation map the calibrated curves are built
+// from.
+async function runStaircasePhase(step) {
+  const label = `Measuring — ${step.scenario.toUpperCase()}`;
+  const driven = scenarioHoldGroups(step.scenario);
+  const stepped = [...driven, "case"];
+  const start = performance.now();
+
+  // Each group starts its staircase from where the hold controller landed.
+  const startLevel = {};
+  for (const group of stepped) {
+    const held = group === "case" ? HOLD_ASSIST_PWM : optimizer.holdPwm(group) ?? 40;
+    startLevel[group] = Math.round(held / 5) * 5;
+  }
+
+  const maxStages = Math.ceil((100 - Math.min(...Object.values(startLevel))) / STAIRCASE_STEP) + 1;
+  let tripped = false;
+
+  for (let stage = 0; stage < maxStages && !autoRun.abort && !tripped; stage += 1) {
+    if (performance.now() - start >= step.measureMs) break;
+
+    const levelOf = {};
+    for (const group of stepped) {
+      levelOf[group] = Math.min(100, startLevel[group] + stage * STAIRCASE_STEP);
+      await setGroupPwm(group, levelOf[group]);
+    }
+
+    // Dwell until the driven temperatures are steady at this level.
+    const dwellStart = performance.now();
+    while (!autoRun.abort) {
+      const dwell = (performance.now() - dwellStart) / 1000;
+      const elapsed = performance.now() - start;
+      if (elapsed >= step.measureMs) break;
+      updateAutoProgress(
+        `${label} — stage ${stage + 1}/${maxStages} (${driven.map((group) => `${group} @ ${levelOf[group]}%`).join(", ")})`,
+        elapsed, step.measureMs);
+      if (await safetyTripped(label)) { tripped = true; break; }
+      if (dwell >= STAIRCASE_DWELL_MAX_S) break;
+      if (dwell >= STAIRCASE_DWELL_MIN_S && drivenTempsFlat(step.scenario, 12, 0.8)) break;
+      await delay(1000);
+    }
+    if (autoRun.abort || tripped) break;
+
+    // Record the steady source temperature for every stepped fan at this level.
+    for (const fan of telemetry.fans.filter((item) => isOptimized(item) && stepped.includes(item.role))) {
+      optimizer.recordDissipation(step.scenario, fan.id, levelOf[fan.role], sourceTempForFan(fan, telemetry.sensors));
+    }
+    logActivity(`${label}: stage ${stage + 1} recorded (${driven
+      .map((group) => `${group} @ ${levelOf[group]}% → ${(group === "cpu" ? telemetry.sensors.cpuTempC : telemetry.sensors.gpuTempC).toFixed(1)}°`)
+      .join(", ")})`);
+
+    // Stop early when everything is far below target — more airflow is pointless.
+    const allCold = driven.every((group) => {
+      const temp = group === "cpu" ? telemetry.sensors.cpuTempC : telemetry.sensors.gpuTempC;
+      const target = group === "cpu" ? optimizer.targets.cpuTempC : optimizer.targets.gpuTempC;
+      return temp <= target - 18;
+    });
+    if (allCold) {
+      logActivity(`${label}: components far below target — staircase complete early`);
+      break;
+    }
+    if (stepped.every((group) => levelOf[group] >= 100)) break;
+  }
+
+  autoRun.doneMs += step.measureMs;
+}
+
+// Phase 3: cool back toward the session baseline before the next scenario.
+async function runCooldownPhase(step, baselineCpu) {
+  loadController.stop();
+  for (const group of ["cpu", "gpu", "case"]) await setGroupPwm(group, 60);
+  renderAll();
+
+  const start = performance.now();
+  while (!autoRun.abort) {
+    const elapsed = performance.now() - start;
+    if (elapsed >= step.cooldownMs) break;
+    updateAutoProgress("Cooldown", elapsed, step.cooldownMs);
+    if (elapsed > 20_000 && telemetry.sensors.cpuTempC <= baselineCpu + 6) break;
+    await delay(1000);
+  }
+  autoRun.doneMs += step.cooldownMs;
 }
 
 function updateAutoProgress(label, phaseElapsed, phaseDuration) {
@@ -519,14 +669,6 @@ function updateAutoProgress(label, phaseElapsed, phaseDuration) {
   const consumed = Math.min(autoRun.doneMs + Math.min(phaseElapsed, phaseDuration), total);
   elements.autoProgress.style.width = `${((consumed / total) * 100).toFixed(1)}%`;
   elements.autoStatus.textContent = `${label} — ${formatDuration(total - consumed)} remaining`;
-}
-
-// True when the CPU temperature has stopped climbing (heat soak reached): less than
-// 1°C of movement across the last 12 optimizer samples (~12 s).
-function cpuTempFlat() {
-  const recent = optimizer.samples.slice(-12).map((sample) => sample.sensors.cpuTempC);
-  if (recent.length < 12) return false;
-  return Math.max(...recent) - Math.min(...recent) < 1.0;
 }
 
 document.querySelectorAll("[data-load]").forEach((button) => {
@@ -576,7 +718,10 @@ function renderAll() {
   renderMetric(elements.gpuTemp, telemetry?.sensors.gpuTempC, optimizer.targets.gpuTempC);
   renderMetric(elements.caseTemp, telemetry?.sensors.caseTempC, optimizer.targets.caseTempC);
 
-  if (optimizer.mode === "optimizing") {
+  if (autoRun.active) {
+    elements.optimizerMode.textContent = "Auto";
+    elements.optimizerMode.title = "Auto-optimization routine is driving the fans";
+  } else if (optimizer.mode === "optimizing") {
     elements.optimizerMode.textContent = loadState.mode === "idle" ? "Holding" : "Learning";
     elements.optimizerMode.title = loadState.mode === "idle"
       ? "Optimizer is adjusting fans but no load test is running, so no scenario data is being recorded"
@@ -669,7 +814,7 @@ function renderCurveChart() {
     // Legend (wraps onto a second row when there are many fans).
     const legendX = x0 + (index % 4) * 200;
     const legendY = 16 + Math.floor(index / 4) * 18;
-    const roleText = fan.role === "cpu" ? "CPU" : "System";
+    const roleText = fan.role === "cpu" ? "CPU" : fan.role === "gpu" ? "GPU" : "System";
     svg += `<rect x="${legendX}" y="${legendY - 9}" width="14" height="4" rx="2" fill="${color}"/>`;
     svg += `<text class="chart-legend" x="${legendX + 20}" y="${legendY}">${escapeSvg(fan.label)} · ${roleText}</text>`;
   });
@@ -705,8 +850,8 @@ function renderFans() {
     const roleLabel = document.createElement("label");
     roleLabel.textContent = "Role";
     const role = document.createElement("select");
-    const roleLabels = { cpu: "CPU cooler", case: "System fan", ignore: "Ignore (GPU/BIOS)" };
-    for (const option of ["cpu", "case", "ignore"]) {
+    const roleLabels = { cpu: "CPU cooler", case: "System fan", gpu: "GPU cooler", ignore: "Ignore (BIOS)" };
+    for (const option of ["cpu", "case", "gpu", "ignore"]) {
       const item = document.createElement("option");
       item.value = option;
       item.textContent = roleLabels[option];

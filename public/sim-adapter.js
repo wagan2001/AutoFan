@@ -10,7 +10,7 @@ export class BrowserSimAdapter {
       { id: "cpu_cooler", label: "CPU cooler", role: "cpu", fanType: "air", source: "motherboard", identifier: "/lpc/sim/0/control/0", rpmIdentifier: "/lpc/sim/0/fan/0", pwm: 35, rpm: 850, minPwm: 20, maxPwm: 100 },
       { id: "case_intake", label: "Case intake", role: "case", fanType: "cpu_intake", source: "motherboard", identifier: "/lpc/sim/0/control/1", rpmIdentifier: "/lpc/sim/0/fan/1", pwm: 30, rpm: 620, minPwm: 18, maxPwm: 100 },
       { id: "case_exhaust", label: "Case exhaust", role: "case", fanType: "exhaust", source: "motherboard", identifier: "/lpc/sim/0/control/2", rpmIdentifier: "/lpc/sim/0/fan/2", pwm: 30, rpm: 650, minPwm: 18, maxPwm: 100 },
-      { id: "gpu_fan", label: "GPU fan", role: "ignore", fanType: "", source: "gpu", identifier: "/gpu-nvidia/0/control/1", rpmIdentifier: "/gpu-nvidia/0/fan/1", pwm: 40, rpm: 1100, minPwm: 0, maxPwm: 100 }
+      { id: "gpu_fan", label: "GPU fan", role: "gpu", fanType: "gpu", source: "gpu", identifier: "/gpu-nvidia/0/control/1", rpmIdentifier: "/gpu-nvidia/0/fan/1", pwm: 40, rpm: 1100, minPwm: 0, maxPwm: 100 }
     ];
     this.temps = { cpu: 36, gpu: 34, case: 31, ambient: 23 };
   }
@@ -49,11 +49,12 @@ export class BrowserSimAdapter {
     const cpuLoad = load.cpu ? 1 : 0.08;
     const gpuLoad = load.gpu ? 1 : 0.06;
     const cpuFan = this.fanByRole("cpu");
+    const gpuFan = this.fanByRole("gpu");
     const caseFans = this.fans.filter((fan) => fan.role === "case");
     const casePwm = average(caseFans.map((fan) => fan.pwm), 30);
 
     const cpuTarget = this.temps.ambient + 13 + cpuLoad * 61 - cpuFan.pwm * 0.43 - casePwm * 0.07;
-    const gpuTarget = this.temps.ambient + 11 + gpuLoad * 56 - casePwm * 0.22;
+    const gpuTarget = this.temps.ambient + 11 + gpuLoad * 66 - gpuFan.pwm * 0.34 - casePwm * 0.14;
     const caseTarget = this.temps.ambient + 7 + cpuLoad * 8 + gpuLoad * 13 - casePwm * 0.16;
 
     this.temps.cpu += (cpuTarget - this.temps.cpu) * 0.05 * dt;

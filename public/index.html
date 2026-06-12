@@ -56,13 +56,16 @@
             <label class="target-field">CPU target °C
               <input id="cpu-target" type="number" min="60" max="95" step="1">
             </label>
+            <label class="target-field">GPU target °C
+              <input id="gpu-target" type="number" min="60" max="90" step="1">
+            </label>
             <button type="button" class="secondary" data-target-preset="ryzen">Ryzen · 85°</button>
             <button type="button" class="secondary" data-target-preset="intel">Intel · 90°</button>
           </div>
           <div class="progress" role="progressbar" aria-label="Auto-optimization progress">
             <div id="auto-progress"></div>
           </div>
-          <p class="hint">Auto-Optimize runs CPU, GPU, and full-system loads in sequence: heat soak first, then measurement, with cooldowns between scenarios. ~9–14 minutes total.</p>
+          <p class="hint">Auto-Optimize runs CPU, GPU, and full-system loads in sequence. Each scenario first holds the component at its temperature target so heat soaks into the cooler, then steps fan PWM upward measuring how heat is dissipated at each level, then cools down. Up to ~35 minutes planned; usually much less.</p>
         </article>
 
         <article class="panel wide">

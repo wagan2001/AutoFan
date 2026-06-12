@@ -49,7 +49,7 @@ for (const fan of telemetry.fans) {
 // 2. Under sustained full CPU load the loop ramps fans: the CPU fan must be well above
 // its idle duty and the temperature held below the throttle-ish region of the sim.
 const cpuFan = telemetry.fans.find((fan) => fan.role === "cpu");
-assert.ok(cpuFan.pwm > 50, `CPU fan should have ramped under load, got ${cpuFan.pwm}%`);
+assert.ok(cpuFan.pwm > 45, `CPU fan should have ramped well above its 35% idle under load, got ${cpuFan.pwm}%`);
 assert.ok(peakCpu < 95, `simulated CPU should stay under 95°C, peaked at ${peakCpu}`);
 
 // 3. Scenario points were learned for the active load mode.
@@ -157,7 +157,11 @@ assert.deepEqual(
   const enabled = config.FanControl.Controls.filter((control) => control.Enable);
   assert.equal(enabled.length, fcProfile.fans.length, "every optimized fan gets an enabled control");
   const gpuControl = config.FanControl.Controls.find((control) => control.NickName === "GPU fan");
-  assert.ok(gpuControl && !gpuControl.Enable && gpuControl.IsHidden, "GPU fan must be exported disabled+hidden");
+  assert.ok(gpuControl && gpuControl.Enable && !gpuControl.IsHidden, "GPU fan must be exported enabled (GPU control is on)");
+  assert.equal(config.Sensors.NvAPIWrapperSettings.Enabled, true, "NvAPI wrapper must be enabled for GPU fan control");
+  const gpuCurveName = gpuControl.SelectedFanCurve.Name;
+  const gpuCurve = config.FanControl.FanCurves.find((curve) => curve.Name === gpuCurveName);
+  assert.equal(gpuCurve.SelectedTempSource.Identifier, "Time/AFT GPU Average", "GPU fan curve must follow the GPU sensor");
 
   assert.equal(config.FanControl.FanCurves.length, fcProfile.fans.length);
   for (const curve of config.FanControl.FanCurves) {
@@ -165,6 +169,73 @@ assert.deepEqual(
     assert.ok(curve.SelectedTempSource.Identifier.startsWith("Time/AFT"), "curves must follow the averaged custom sensors");
   }
   assert.equal(config.FanControl.CustomSensors.length, 2, "cpu + gpu averaged sensors expected");
+}
+
+// 11. Hold controller: under full CPU load it should ride the CPU at the target
+// temperature (heat soak), not cool maximally.
+{
+  const sim = new BrowserSimAdapter();
+  const opt = new FanOptimizer();
+  opt.setCpuTarget(78);
+  const load = { mode: "cpu", cpu: true, gpu: false };
+  let tel = await sim.readTelemetry(load);
+  opt.beginHold(tel);
+
+  const errors = [];
+  for (let i = 0; i < 900; i += 1) {
+    opt.observe(tel, load);
+    const recs = opt.holdTick(tel, "cpu");
+    for (const rec of recs) await sim.setFanPwm(rec.fanId, rec.pwm);
+    tel = await sim.readTelemetry(load);
+    errors.push(opt.holdError(tel, "cpu"));
+  }
+
+  const tail = errors.slice(-200);
+  const meanError = tail.reduce((sum, value) => sum + value, 0) / tail.length;
+  assert.ok(Math.min(...errors) <= 3, "hold should reach the target band at some point");
+  assert.ok(meanError <= 5, `hold should ride near target (mean tail error ${meanError.toFixed(2)}°)`);
+  assert.ok(Math.max(...tail) < 95 - 78, "hold must stay within safe range of target");
+}
+
+// 12. Dissipation staircase data: a calibrated curve must be quiet at the target when
+// measurements show diminishing returns, and still reach 100% above the target.
+{
+  const opt = new FanOptimizer();
+  opt.setCpuTarget(85);
+  const fan = { id: "f", label: "CPU cooler", role: "cpu", fanType: "air", pwm: 50, minPwm: 0, maxPwm: 100 };
+  // Typical thermally-dense CPU: more airflow barely lowers the steady temperature.
+  for (const [pwm, temp] of [[35, 85], [45, 82], [55, 80], [65, 79], [75, 78.5], [85, 78.2], [100, 78]]) {
+    opt.recordDissipation("cpu", fan.id, pwm, temp);
+  }
+
+  const profile = opt.buildProfile([fan]);
+  const curve = profile.fans[0].curve;
+  const pwmAt = (t) => curve.find((point) => point.tempC === t).pwm;
+
+  assert.ok(pwmAt(85) <= 55,
+    `calibrated curve should be quiet at target (got ${pwmAt(85)}%) — measured dissipation says 35% holds 85°`);
+  assert.equal(pwmAt(95), 100, "curve must reach 100% above the target");
+  assert.ok(pwmAt(50) < pwmAt(75), "curve must still ramp with temperature");
+  for (let i = 1; i < curve.length; i += 1) {
+    assert.ok(curve[i].pwm >= curve[i - 1].pwm, "calibrated curve must be monotonic");
+  }
+
+  // Round-trip: dissipation data survives serialize -> hydrate (page reload).
+  const reloaded = new FanOptimizer();
+  reloaded.hydrateDissipation(profile.dissipation);
+  assert.equal(reloaded.dissipation.cpu.length, 7, "dissipation measurements must round-trip");
+  assert.deepEqual(reloaded.buildProfile([fan]).fans[0].curve, curve, "rehydrated curve must match");
+}
+
+// 13. GPU role: gpu fans are optimized, follow the GPU temperature, and respect the
+// GPU target.
+{
+  const opt = new FanOptimizer();
+  assert.equal(opt.setGpuTarget(80), 80);
+  assert.equal(opt.setGpuTarget(150), 90, "gpu target must clamp");
+  const gpuFan = { id: "g", label: "GPU fan", role: "gpu", fanType: "gpu", pwm: 30, minPwm: 0, maxPwm: 100 };
+  assert.ok(isOptimized(gpuFan), "gpu role must be optimized");
+  assert.equal(opt.targetForFan(gpuFan), opt.targets.gpuTempC);
 }
 
 console.log("optimizer test passed");

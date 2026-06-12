@@ -20,8 +20,9 @@ const hysteresis = (responseTime) => ({
 });
 
 // Which time-averaged custom sensor a fan's curve should follow.
-function curveSourceFor(fanType, sources) {
-  if (fanType === "gpu_intake" && sources.gpu) return sources.gpu;
+function curveSourceFor(fan, sources) {
+  if (fan.role === "gpu" && sources.gpu) return sources.gpu;
+  if (fan.fanType === "gpu_intake" && sources.gpu) return sources.gpu;
   // cpu coolers, cpu intake, and exhaust follow the CPU average; FanControl mix
   // curves can be layered on by the user later if they want multi-source exhaust.
   return sources.cpu ?? sources.gpu;
@@ -72,7 +73,7 @@ export function buildFanControlConfig(profile, allFans, sensorIdentifiers) {
       Name: name,
       IsHidden: false,
       CommandMode: 0, // percent PWM
-      SelectedTempSource: { Identifier: curveSourceFor(fan.fanType, sources) },
+      SelectedTempSource: { Identifier: curveSourceFor(fan, sources) },
       Points: fan.curve.map((point) => `${point.tempC},${point.pwm}`),
       MaximumTemperature: 120,
       MinimumTemperature: 20,
@@ -139,7 +140,8 @@ export function buildFanControlConfig(profile, allFans, sensorIdentifiers) {
         StorageUpdateInterval: "00:01:00",
         ZeroRPMOverride: false
       },
-      NvAPIWrapperSettings: { Enabled: false, ZeroRPMOverride: false }
+      // FanControl needs its NvAPI wrapper enabled to drive GPU fan controls.
+      NvAPIWrapperSettings: { Enabled: profile.fans.some((fan) => fan.role === "gpu"), ZeroRPMOverride: false }
     },
     MainWindow: {
       Fahrenheit: false,

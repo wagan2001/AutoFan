@@ -120,9 +120,10 @@ internal sealed class HardwareMonitor
         var rawName = control?.Name ?? fan?.Name ?? id;
         if (!_config.TryGetValue(id, out var cfg))
         {
-            // GPU fans are left to BIOS by design, so default them to "ignore" — only
-            // motherboard/EC fans are optimization candidates out of the box.
-            var role = source == "gpu" ? "ignore" : "case";
+            // GPU fans default to the "gpu" role (controlled, following the GPU
+            // temperature target). Users can set any fan to "ignore" to leave it
+            // on firmware control.
+            var role = source == "gpu" ? "gpu" : "case";
             cfg = new FanConfigEntry
             {
                 Label = rawName,
@@ -140,6 +141,7 @@ internal sealed class HardwareMonitor
     {
         "cpu" => "air",
         "case" => "exhaust",
+        "gpu" => "gpu",
         _ => ""
     };
 
